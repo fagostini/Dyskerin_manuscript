@@ -1,0 +1,1606 @@
+---
+title: "Dyskerin data analysis"
+author: |
+date: "26 August 2018"
+output:
+  html_notebook:
+    code_folding: hide
+    collapsed: yes
+    fig_caption: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r knitr, include=FALSE}
+require("knitr")
+```
+
+
+```{r setup_parameters, echo=FALSE}
+working.folder    = "."
+annotation.folder = file.path(working.folder, "data", "Annotation")
+rnaseq.folder     = file.path(working.folder, "data", "RNAseq_data")
+clipseq.folder    = file.path(working.folder, "data", "CLIPseq_data")
+chipseq.folder    = file.path(working.folder, "data", "ChIPseq_data")
+
+setwd(working.folder)
+opts_chunk$set(root.dir = working.folder, dev = 'png', echo = TRUE)
+
+cat(sessionInfo()$R.version$version.string, fill=TRUE)
+cat(paste("Platform", sessionInfo()$platform), fill=TRUE)
+cat(paste("Running under", sessionInfo()$running), fill=TRUE)
+cat(paste("Last knitted on", date()), fill=TRUE)
+cat(paste0("Working directory set to ", working.folder), fill=TRUE)
+cat(paste0("Annotation directory set to ", annotation.folder), fill=TRUE)
+cat(paste0("RNA-seq data directory set to ", rnaseq.folder), fill=TRUE)
+cat(paste0("iCLIP data directory set to ", clipseq.folder), fill=TRUE)
+cat(paste0("ChIP-seq data directory set to ", chipseq.folder), fill=TRUE)
+```
+
+
+```{r create_output_directories}
+output_dirs = c("RData", "tables", "plots", "images", "beds")
+for( dir in output_dirs ){
+  if( !dir.exists(file.path(working.folder, dir)) ){
+    log = dir.create(file.path(working.folder, dir))
+  }
+}
+```
+
+
+```{r load_required_packages}
+require("GenomicFeatures")
+require("GenomeInfoDb")
+require("data.table")
+require("ggpubr")
+require("ggsci")
+require("scales")
+require("ggthemes")
+require("tximport")
+require("DESeq2")
+require("IHW")
+require("org.Hs.eg.db")
+require("UpSetR")
+require("GGally")
+require("outliers")
+
+
+
+# require("BSgenome.Hsapiens.UCSC.hg38")
+
+# require("pheatmap")
+# require("RColorBrewer")
+# require("parallel")
+# require("cowplot")
+# require("viridis")
+# require("ComplexHeatmap")
+# require("GenomicAlignments")
+# require("zoo")
+```
+
+
+```{r countOverlapsWeighted_function}
+countOverlapsWeighted <- function(query, subject, ignore.strand=FALSE, opposite.strand=FALSE, remove.overlaps=NULL, type="any"){
+      
+   if(opposite.strand){
+      if(class(query)[1] == "GRangesList"){
+         tmp = unlist(query)
+         invertStrand(tmp)
+         query = relist(tmp, query)
+      }else{
+         query = invertStrand(query)
+      }
+      if(!is.null(remove.overlaps))
+         subject = subject[!overlapsAny(subject, remove.overlaps, ignore.strand = FALSE),]
+   }
+   
+   overlaps <- data.table(data.frame(findOverlaps(query, subject,
+                                                  ignore.strand=ignore.strand,
+                                                  type=type)))
+   
+   setkey(overlaps, queryHits)
+   overlaps[, score := subject$score[overlaps[, subjectHits]]]
+   overlaps = overlaps[, .(score=sum(score)), by=key(overlaps)]
+   
+   counts = vector(mode="numeric", length=length(query))
+   counts[overlaps[, queryHits]] = overlaps[, score]
+   
+   return(counts)
+   
+}
+```
+
+
+```{r countToTPM_function}
+countToTPM <- function(countVector, regionSet){
+   
+   if(class(regionSet)[1] == "GRangesList"){
+      TscLength = sum(width(regionSet))
+   }else{
+      TscLength = width(regionSet)
+   }
+   normTscCount = sum(countVector / TscLength)
+   tpm = (countVector*1e6) / (normTscCount*TscLength)
+   
+   return(tpm)
+
+}
+```
+
+
+```{r distance_profile_function}
+distanceToReference <- function(query, subject, width=100, fix=c("start", "end", "center"), ignore.strand=FALSE, collapse=TRUE, normType=c("none", "density", "max"), mcolsKey=NULL){
+  
+  fix = match.arg(fix)
+  normType = match.arg(normType)
+ 
+  query = resize(query, width=0, fix=fix)
+ 
+  if( !is.null(mcolsKey) ){
+    stopifnot( mcolsKey%in%colnames(mcols(query)) )
+    splitFactors = as.data.table(mcols(query))[, eval(mcolsKey), with=FALSE]
+    splitFactors = apply(splitFactors, 1, function(x) paste(gsub(" ", "", x), collapse = "_____"))
+    query = split(query, splitFactors)
+  }else{
+    query = GRangesList(query)
+  }
+  
+  res = lapply(query,
+               function(x){
+                 temp = flank(x, width=width-1, start=TRUE, both=TRUE)
+                 overlaps = as.data.table(findOverlaps(temp, subject, ignore.strand=ignore.strand, maxgap=0))
+                 toAdd = NULL
+                 if( nrow(overlaps) > 0 ){
+                   overlaps[, distance := distance(x[queryHits,], subject[subjectHits,])+1] # Count is 1-based from the TSS, which is the 0
+                   overlaps[, qStrand := as.character(strand(x[queryHits,]))]
+                   overlaps[qStrand%in%c("+", "*"), distance := ifelse(start(x[queryHits,]) > end(subject[subjectHits,]), -distance, distance)]
+                   overlaps[qStrand=="-", distance := ifelse(end(x[queryHits,]) < start(subject[subjectHits,]), -distance, distance)]
+                 }else{
+                   message("No overlaps found!")
+                   return(NULL)
+                 }
+                 
+                 result = overlaps[, .N, by=c("queryHits", "distance")]
+                 
+                 if( normType == "density" ){
+                   result[, Norm := N/sum(N), by="queryHits"]
+                 }else if( normType == "max" ){
+                   result[, Norm := N/max(N), by="queryHits"]
+                 }else{
+                   result[, Norm := N, by="queryHits"]
+                 }
+                 
+                 if( collapse == TRUE ){
+                   result = rbindlist(list(data.table(queryHits = NA, distance = seq(-width, width, 1), N = 0, Norm = rep(0, width*2+1)), result))
+                   result = result[, .(Count = sum(N), Mean = sum(Norm)/length(x), N=length(x)), by="distance"]
+                   return(result)
+                 }else{
+                   return(overlaps)
+                 }
+               })
+  if( !is.null(names(res)) ){
+    res = rbindlist(res, idcol="splitLabel")
+    res[, eval(mcolsKey) := tstrsplit(splitLabel, "_____")]
+    res[, splitLabel := NULL]
+  }else{
+    res = rbindlist(res)  
+  }
+  return(res)
+}
+
+# DKC1_peaks = rbindlist(lapply(bed.iclip,
+#                     function(x)
+#                       distanceToReference(intersect(bed.peaks[[1]], bed.peaks[[2]]), x, width=250, fix="center", normType="density")[distance!=0]), idcol="Dataset")
+# ggplot(DKC1_peaks, aes(x=distance, y=Mean, col=Dataset)) + geom_line() + scale_colour_tableau(palette="Tableau 20")
+# 
+# GAR1_peaks = rbindlist(lapply(bed.iclip,
+#                     function(x)
+#                       distanceToReference(intersect(bed.peaks[[3]], bed.peaks[[4]]), x, width=250, fix="center", normType="density")[distance!=0]), idcol="Dataset")
+# ggplot(DKC1_peaks, aes(x=distance, y=Mean, col=Dataset)) + geom_line() + scale_colour_tableau(palette="Tableau 20")
+
+# a = genes.pc.granges[rnaseq_gene_tpm[TPM>=1, unique(gene_id)]]
+# b = subsetByOverlaps(BLISS_data[[4]], flank(a, width = 20, start=TRUE, both = TRUE))
+# 
+# # Sanity check - global
+# g = distanceToReference(a, b, width=20, fix="start", collapse=TRUE, normType="none")[distance==0, `:=`(Count = NA, Mean = NA)]
+# ggplot(g, aes(x=distance, y=Mean)) + geom_line() + geom_point() + geom_vline(xintercept = 0, linetype="dashed", col="grey25") + theme_bw()
+# 
+# # Sanity check - individual
+# g = distanceToReference(genes.pc.granges["ENSG00000003096.9"], BLISS_data[[4]], width=10, fix="start", collapse=TRUE, normType="none")[distance!=0,] # -2, 10
+# ggplot(g, aes(x=as.factor(distance), y=Mean, group=as.factor(1))) + geom_line() + geom_point()
+# g = distanceToReference(genes["ENSG00000234524.1"], BLISS_data[[4]], width=20, fix="start", collapse=TRUE, normType="none")[distance!=0,] # -6, 18
+# ggplot(g, aes(x=as.factor(distance), y=Mean, group=as.factor(1))) + geom_line() + geom_point()
+```
+
+
+```{r load_annotation_objects}
+# Remove mitochondrial chromosome, and Y chromosome (U2OS are female)
+chromosomes = grep("chrM|chrY", genomeStyles()[["Homo_sapiens"]]$UCSC, invert = TRUE, value = TRUE)
+
+chrominfo = sortSeqlevels(with(fread(file.path(annotation.folder, "hg38.chrom.sizes"))[V1%in%chromosomes,],
+                               Seqinfo(V1, seqlengths = V2, genome = "hg38")))
+
+if ( !file.exists(file.path(annotation.folder, "hg38_Gencode27.sqlite")) ){
+    TxDb = makeTxDbFromGFF(file = file.path(annotation.folder, "gencode.v27.annotation.gff3.gz"),
+                         format = "gff3",
+                         dataSource = "Gencode version 27",
+                         organism = "Homo sapiens",
+                         chrominfo = chrominfo)
+    saveDb(TxDb, file = file.path(annotation.folder, "hg38_Gencode27.sqlite"))
+} else {
+    TxDb = loadDb(file.path(annotation.folder, "hg38_Gencode27.sqlite"))
+}
+
+load(file.path(annotation.folder, "RData", "hg38_Gencode27_genes_annotations.RData"))
+load(file.path(annotation.folder, "RData", "hg38_Gencode27_genes_annotations_minimal.RData"))
+load(file.path(annotation.folder, "RData", "hg38_Gencode27_txs_annotations_minimal.RData"))
+
+genes.regions = readRDS(file.path(annotation.folder, "RData", "hg38_Gencode27_annotations.all.genes.regions.rds"))
+
+genes = genes[seqnames(genes)%in%chromosomes,]
+
+gene_summary = data.table(as.data.frame(genes), key="gene_id")
+```
+
+
+```{r add_biotype_groups}
+# Define protein-coding genes, long_ncRNAs, ncRNAs and other
+protein.coding = c("protein_coding", paste(rep(c("IG","TR"), each=4), c("C","D","J","V"), "gene", sep="_"), "IG_LV_gene")
+long.ncRNA = c("3prime_overlapping_ncRNA", "lincRNA", "antisense", "processed_transcript", "sense_intronic", "sense_overlapping",
+               "bidirectional_promoter_lncRNA", "macro_lncRNA", "non_coding")
+ncRNA = c(setdiff(grep("RNA", names(geneBT), value=TRUE), long.ncRNA), "ribozyme")
+other = setdiff(names(geneBT), c(ncRNA, long.ncRNA, protein.coding))
+
+# Extract groups
+protein.coding = as.vector(unlist(geneBT[protein.coding]))
+long.ncRNA = as.vector(unlist(geneBT[long.ncRNA]))
+ncRNA = as.vector(unlist(geneBT[ncRNA]))
+other = as.vector(unlist(geneBT[other]))
+
+gene.metadata[, gene_group := factor(as.character(NA), levels=c("ncRNA", "long_ncRNA", "protein_coding", "other"))]
+gene.metadata[gene_id%in%protein.coding, gene_group := "protein_coding"]
+gene.metadata[gene_id%in%long.ncRNA, gene_group := "long_ncRNA"]
+gene.metadata[gene_id%in%ncRNA, gene_group := "ncRNA"]
+gene.metadata[gene_id%in%other, gene_group := "other"]
+```
+
+
+```{r export_biotype_GRanges, eval=FALSE}
+genes.pc.granges = genes.pc.granges[order(-width(genes.pc.granges)),]
+export.bed(genes.pc.granges,  file.path(working.folder, "beds", "gencode.v27.protein_coding.bed"))
+
+genes.nc.granges = genes.nc.granges[order(-width(genes.nc.granges)),]
+export.bed(genes.nc.granges, file.path(working.folder, "beds", "gencode.v27.long_non-coding.bed"))
+
+genes.snc.granges = c("snRNA", "snoRNA", "rRNA", "Mt_tRNA", "Mt_rRNA", "misc_RNA", "miRNA", "ribozyme", "sRNA", "scaRNA", "vaultRNA")
+genes.snc.granges = unlist(geneBT[genes.snc.granges], use.names = FALSE)
+  
+genes.snc.granges = genes[genes.snc.granges[genes.snc.granges%in%names(genes)],]
+genes.snc.granges = genes.snc.granges[order(-width(genes.snc.granges)),]
+export.bed(genes.snc.granges, file.path(working.folder, "beds", "gencode.v27.small_non-coding.bed"))
+```
+
+
+```{r load_Salmon_results}
+# USER_ACTION: Add the paths to the Salmon quantification folders:
+sampleTable = data.table(Sample = list.files(file.path(rnaseq.folder, "salmon")))
+sampleTable[, c("Treatment", "Replicate") := tstrsplit(Sample, "_")[c(3, 5)]]
+sampleTable[, Label := paste(Treatment, Replicate, sep="_")]
+
+# Bash command to generate the tx2gene reference table
+# gffread gencode.v27.annotation.gff3 --table transcript_id,gene_id -o tx2gene.tsv
+tx2gene = fread(file.path(rnaseq.folder, "tx2gene.tsv"), header=FALSE, col.names = c("TXNAME", "GENEID"))
+
+sampleTable[, File := file.path(rnaseq.folder, "salmon", sampleTable[, Sample], "quant.sf")]
+
+gn.salmon  = tximport(sampleTable[, setNames(File, Label)], type = "salmon", tx2gene = tx2gene, countsFromAbundance = "lengthScaledTPM")
+tx.salmon  = tximport(sampleTable[, setNames(File, Label)], type = "salmon", tx2gene = tx2gene, countsFromAbundance = "lengthScaledTPM", txOut = TRUE)
+
+gene_expression = data.table(data.frame(TPM = rowMeans(gn.salmon[["abundance"]][, grepl("Untreated", colnames(tx.salmon[["abundance"]]))])), keep.rownames = "gene_id")
+# gene_expression = data.table(data.frame(TPM = rowMeans(gn.salmon[["abundance"]][, grepl("siCtrl", colnames(tx.salmon[["abundance"]]))])), keep.rownames = "gene_id")
+
+expressed_genes = gene_expression[TPM>=1]
+
+fwrite(gene_expression, file.path(working.folder, "tables", "RNAseq_gene_expression.tsv"), sep="\t", quote = FALSE)
+fwrite(expressed_genes, file.path(working.folder, "tables", "RNAseq_expressed_genes.tsv"), sep="\t", quote = FALSE)
+
+transcript_expression = data.table(data.frame(TPM = rowMeans(tx.salmon[["abundance"]][, grepl("Untreated", colnames(tx.salmon[["abundance"]]))]),
+                                    Length = rowMeans(tx.salmon[["length"]][, grepl("Untreated", colnames(tx.salmon[["abundance"]]))])),
+                     keep.rownames = "tx_id")
+# transcript_expression = data.table(data.frame(TPM = rowMeans(tx.salmon[["abundance"]][, grepl("siCtrl", colnames(tx.salmon[["abundance"]]))]),
+#                                     Length = rowMeans(tx.salmon[["length"]][, grepl("siCtrl", colnames(tx.salmon[["abundance"]]))])),
+#                      keep.rownames = "tx_id")
+
+setkey(transcript_expression, tx_id)
+setkey(tx2gene, TXNAME)
+
+transcript_expression[tx2gene, gene_id := GENEID]
+# gene_summary = gene_summary[temp, nomatch=0]
+setcolorder(transcript_expression, c(4, 1:3))
+
+expressed_isoforms = transcript_expression[order(gene_id, -TPM),][!duplicated(gene_id),][TPM>=1,]
+expressed_transcripts = transcript_expression[TPM>=1,]
+
+fwrite(transcript_expression, file.path(working.folder, "tables", "RNAseq_transcript_expression.tsv"), sep="\t", quote = FALSE)
+fwrite(expressed_isoforms, file.path(working.folder, "tables", "RNAseq_expressed_gene_isoform.tsv"), sep="\t", quote = FALSE)
+fwrite(expressed_transcripts, file.path(working.folder, "tables", "RNAseq_expressed_transcripts.tsv"), sep="\t", quote = FALSE)
+```
+
+
+```{r run_DESeq2_salmon}
+order_select = c("siCtrl", "siDKC1", "siGAR1")
+
+dds.salmon = tximport(unlist(lapply(order_select, function(x) sampleTable[Treatment==x, setNames(File, Label)])), type = "salmon", tx2gene = tx2gene)
+
+dds.samples = with(sampleTable[grep(paste(order_select, collapse="|"), Treatment),], data.frame(row.names = Label, Treatment, Replicate, names = Sample))
+dds.samples = dds.samples[unlist(lapply(order_select, function(x) sampleTable[Treatment==x, Label])),]
+dds.samples$Treatment = factor(dds.samples$Treatment, levels=order_select)
+
+ddsTxi = DESeqDataSetFromTximport(dds.salmon, colData = dds.samples, design = ~ Treatment)
+
+keep = rowSums(counts(ddsTxi)) >= 10
+ddsTxi = ddsTxi[keep,]
+
+ddsTxi = DESeq(ddsTxi)
+
+resDKC1 = results(ddsTxi, contrast = c("Treatment", "siDKC1", "siCtrl"))
+resGAR1 = results(ddsTxi, contrast = c("Treatment", "siGAR1", "siCtrl"))
+resCont = results(ddsTxi, contrast = c("Treatment", "siDKC1", "siGAR1"))
+
+resDKC1 = cbind(resDKC1, gene.metadata[match(rownames(resDKC1), gene_id), .(gene_group, gene_type, gene_name)])
+resGAR1 = cbind(resGAR1, gene.metadata[match(rownames(resGAR1), gene_id), .(gene_group, gene_type, gene_name)])
+resCont = cbind(resCont, gene.metadata[match(rownames(resCont), gene_id), .(gene_group, gene_type, gene_name)])
+
+resDKC1 = resDKC1[!grepl("DKC1", resDKC1$gene_name),]
+resGAR1 = resGAR1[!grepl("GAR1", resGAR1$gene_name),]
+resCont = resCont[!grepl("DKC1|GAR1", resCont$gene_name),]
+
+vsd = vst(ddsTxi, blind=FALSE)
+rld = rlog(ddsTxi, blind=FALSE)
+
+lfcDKC1 = lfcShrink(ddsTxi, coef="Treatment_siDKC1_vs_siCtrl", type="apeglm")
+lfcGAR1 = lfcShrink(ddsTxi, coef="Treatment_siGAR1_vs_siCtrl", type="apeglm")
+# lfcCont = lfcShrink(ddsTxi, coef="Treatment_siDKC1_vs_siGAR1", type="apeglm")
+
+resOrdDKC1 = resDKC1[order(resDKC1$pvalue),]
+resOrdGAR1 = resGAR1[order(resGAR1$pvalue),]
+resOrdCont = resCont[order(resCont$pvalue),]
+
+fwrite(as.data.table(resOrdDKC1)[!is.na(padj) & padj<0.01,], file="DESeq2_condition_siDKC1_vs_siCtrl_padj0.01.tsv", sep="\t")
+fwrite(as.data.table(resOrdGAR1)[!is.na(padj) & padj<0.01,], file="DESeq2_condition_siGAR1_vs_siCtrl_padj0.01.tsv", sep="\t")
+fwrite(as.data.table(resOrdCont)[!is.na(padj) & padj<0.01,], file="DESeq2_condition_siDKC1_vs_siGAR1_padj0.01.tsv", sep="\t")
+
+# summary(resDKC1, alpha=0.01)
+# summary(resGAR1, alpha=0.01)
+
+ihwDKC1 = results(ddsTxi, contrast = c("Treatment", "siDKC1", "siCtrl"), filterFun=ihw)
+ihwGAR1 = results(ddsTxi, contrast = c("Treatment", "siGAR1", "siCtrl"), filterFun=ihw)
+ihwCont = results(ddsTxi, contrast = c("Treatment", "siDKC1", "siGAR1"), filterFun=ihw)
+
+summary(ihwDKC1, alpha=0.01)
+summary(ihwGAR1, alpha=0.01)
+summary(ihwCont, alpha=0.01)
+
+# plotMA(resDKC1, ylim=c(-2, 2))
+# plotMA(resGAR1, ylim=c(-2, 2))
+# 
+# plotMA(lfcDKC1, ylim=c(-2, 2))
+# plotMA(lfcGAR1, ylim=c(-2, 2))
+
+# ggl = list(siDKC1 = data.frame(plotCounts(ddsTxi, gene=which.min(resDKC1$padj), intgroup="Treatment", returnData=TRUE),
+#                                name = resDKC1[which.min(resDKC1$padj),]$gene_name),
+#            siGAR1 = data.frame(plotCounts(ddsTxi, gene=which.min(resGAR1$padj), intgroup="Treatment", returnData=TRUE),
+#                                name = resGAR1[which.min(resGAR1$padj),]$gene_name))
+# 
+# ggl = lapply(seq_along(ggl),
+#              function(i)
+#                ggplot(ggl[[i]], aes(x=Treatment, y=count)) +
+#                ggtitle(unique(ggl[[i]]$name)) +
+#                geom_point(position=position_jitter(w=0.1,h=0)) + 
+#                scale_y_log10(breaks=c(25,100,400)) +
+#                theme_pubr())
+# gg = ggarrange(plotlist=ggl, ncol=2)
+```
+
+
+```{r plot_RNAseq_PCA}
+# pcaData = plotPCA(vsd, intgroup=c("Treatment", "Replicate"), returnData=TRUE)
+# percentVar = round(100 * attr(pcaData, "percentVar"))
+# 
+# gg = ggplot(pcaData, aes(PC1, PC2, color=Treatment, shape=Replicate)) +
+#   geom_point(size=4) +
+#   xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+#   ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+#   coord_fixed() +
+#   scale_color_npg(name = "Condition") +
+#   guides(colour=guide_legend(title="Condition"), shape=guide_legend(title="Replicate")) +
+#   theme_light() + theme(legend.position="top")
+
+pcaData = plotPCA(rld, intgroup=c("Treatment", "Replicate"), returnData=TRUE)
+percentVar = round(100 * attr(pcaData, "percentVar"))
+gg = ggplot(pcaData, aes(PC1, PC2, color=Treatment, shape=Replicate)) +
+  geom_point(size=4) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+  coord_fixed() +
+  scale_color_npg(name = "Condition") +
+  guides(colour=guide_legend(title="Condition"), shape=guide_legend(title="Replicate")) +
+  theme_light() + theme(legend.position="top")
+
+ggsave(gg, filename = file.path(working.folder, "images", "Figure_S3A.png"), units = "in", width = 8, height = 4, dpi = 300)
+ggsave(gg, filename = file.path(working.folder, "plots","Figure_S3A.pdf"), width = 8, height = 4, device=cairo_pdf)
+```
+
+![](images/Figure_S3A.png)
+
+```{r plot_DESeq2_results}
+pl = results(ddsTxi, name="Treatment_siDKC1_vs_siCtrl")
+pl = as.data.frame(lfcShrink(ddsTxi, coef="Treatment_siDKC1_vs_siCtrl", res=pl))
+ens.str = substr(rownames(pl), 1, 15)
+pl$geneName = mapIds(org.Hs.eg.db,
+                     keys=ens.str,
+                     column="SYMBOL",
+                     keytype="ENSEMBL",
+                     multiVals="first")
+
+gg1 = ggmaplot(pl, main = "DKC1 knockdown",
+         fdr = 0.01, fc = 2, size = 0.75, alpha = 0.75,
+         palette = c(rev(pal_lancet()(2)), "grey75"),
+         genenames = pl$geneName,
+         legend = "top", top = 20,
+         font.label = c("bold", 11),
+         font.legend = "bold",
+         font.main = "bold",
+         ggtheme = theme_few()) + scale_y_continuous(breaks=seq(-3, 3, 1), limits = c(-3, 3))
+
+pl = results(ddsTxi, name="Treatment_siGAR1_vs_siCtrl")
+pl = as.data.frame(lfcShrink(ddsTxi, coef="Treatment_siGAR1_vs_siCtrl", res=pl))
+ens.str = substr(rownames(pl), 1, 15)
+pl$geneName = mapIds(org.Hs.eg.db,
+                     keys=ens.str,
+                     column="SYMBOL",
+                     keytype="ENSEMBL",
+                     multiVals="first")
+
+gg2 = ggmaplot(pl, main = "GAR1 knockdown",
+         fdr = 0.01, fc = 2, size = 0.75, alpha = 0.75,
+         palette = c(rev(pal_lancet()(2)), "grey75"),
+         genenames = pl$geneName,
+         legend = "top", top = 20,
+         font.label = c("bold", 11),
+         font.legend = "bold",
+         font.main = "bold",
+         ggtheme = theme_few()) + scale_y_continuous(breaks=seq(-3, 3, 1), limits = c(-3, 3))
+
+gg = ggarrange(gg1, gg2, ncol=2)
+ggsave(gg, filename = file.path(working.folder, "images", paste0("Figure_S3B.png")), units = "in", width = 12, height = 6, dpi = 300)
+ggsave(gg, filename = file.path(working.folder, "plots", paste0("Figure_S3B.pdf")), width = 12, height = 6, device = cairo_pdf)
+```
+
+![](images/Figure_S3B.png)
+
+```{r plot_DESeq2_results_contrast}
+DKC1 = results(ddsTxi, name="Treatment_siDKC1_vs_siCtrl")
+GAR1 = results(ddsTxi, name="Treatment_siGAR1_vs_siCtrl")
+res = list(DKC1 = data.table(as.data.frame(lfcShrink(ddsTxi, coef="Treatment_siDKC1_vs_siCtrl", res=DKC1)), keep.rownames = TRUE),
+           GAR1 = data.table(as.data.frame(lfcShrink(ddsTxi, coef="Treatment_siGAR1_vs_siCtrl", res=GAR1)), keep.rownames = TRUE))
+
+res = lapply(res, function(x) x[!is.na(padj) & padj<0.01 & (log2FoldChange>log2(2) | log2FoldChange<log2(1/2))])
+
+pl = rbindlist(res, idcol="Target")
+pl[, Regulation := ifelse(log2FoldChange>0, "Upregulated", "Downregulated")]
+pl = with(pl, split(rn, paste(Target, Regulation)))
+
+upplot = upset(data = fromList(pl), sets=paste(rep(c("GAR1", "DKC1"), each=2), c("Downregulated", "Upregulated")), nintersects=20,
+      keep.order = TRUE, order.by = "freq",
+      queries = list(list(query = intersects, params = list("DKC1 Upregulated", "GAR1 Upregulated"),
+                          color=pal_lancet()(2)[2], active = T)))
+
+png(filename = file.path(working.folder, "images", paste0("Figure_S3C.png")), units = "in", width = 10, height = 6, res = 300)
+  print(upplot)
+dev.off()
+
+cairo_pdf(filename = file.path(working.folder, "plots", paste0("Figure_S3C.pdf")), width = 10, height = 6)
+  print(upplot)
+dev.off()
+```
+
+![](images/Figure_S3C.png)
+
+```{r}
+pl2 = rbindlist(lapply(pl, function(x) gene.metadata[gene_id%in%x,]), idcol="Group")
+fwrite(pl2[gene_type%in%c("scaRNA", "snoRNA")], file = "DESeq2_padj0.01_fc1.5_snoRNA-scaRNA.tsv", sep="\t")
+
+sel = genes[pl2[, gene_id]]
+sel = sel[overlapsAny(sel, GRanges(gene.metadata[gene_type%in%c("scaRNA", "snoRNA")])),]
+fwrite(pl2[gene_id%in%names(sel) & !gene_type%in%c("scaRNA", "snoRNA"),], file = "DESeq2_padj0.01_fc1.5_with_snoRNA-scaRNA.tsv", sep="\t")
+
+pl = rbindlist(lapply(pl, function(x) data.table(gene_type = gene.metadata[gene_id%in%x, gene_group])), idcol="Group")
+pl[, c("Knockdown", "Regulation") := tstrsplit(Group, " ")]
+pl[, `:=`(Regulation = factor(Regulation, levels=c("Upregulated", "Downregulated")), gene_type = factor(gene_type, levels=c("protein_coding", "long_ncRNA", "ncRNA", "other")))]
+
+pl2 = pl[, .N, by=c("Knockdown", "gene_type")]
+pl2[, P := N/sum(N), by="Knockdown"]
+pl2[, gene_type := factor(gene_type, levels=c("protein_coding", "long_ncRNA", "ncRNA", "other"))]
+pl2[order(gene_type), pos := 1-(cumsum(P)-P/2), by="Knockdown"]
+gg = ggplot(pl2, aes(x=as.factor(1), y=P, fill=gene_type)) +
+  geom_bar(stat="identity", position="stack", col="black", lwd=0.5) +
+  scale_fill_tableau(palette="Tableau 10") +
+  geom_text(aes(x=1.55, label=N, y=pos), inherit.aes=FALSE) +
+  facet_grid(~Knockdown) +
+  coord_polar(theta="y") +
+  theme_void() + theme(legend.position="bottom") + guides(fill=guide_legend(title="Biotype group"))
+ggsave(gg, filename = file.path(working.folder, "images", "Figure_S3D.png"), dpi = 300, width = 8, height = 4)
+ggsave(gg, filename = file.path(working.folder, "plots", "Figure_S3D.pdf"), device = cairo_pdf, dpi = 300, width = 8, height = 4)
+
+# pl2 = pl[, .N, by=c("Knockdown", "Regulation", "gene_type")]
+# pl2 = melt.data.table(dcast.data.table(pl2, Knockdown+Regulation~gene_type, value.var="N", fill=0), id.vars=c("Knockdown", "Regulation"))
+# pl2[, offset := ifelse(Regulation=="Upregulated", -0.225, +0.225)]
+# gg = ggplot(pl2, aes(x=variable, y=value, fill=Regulation)) +
+#   geom_bar(stat="identity", position="dodge", col="black", lwd=0.5) +
+#   scale_x_discrete("Biotype group") + scale_y_continuous("Count") +
+#   scale_fill_lancet(alpha=0.75) +
+#   geom_text(aes(x=as.numeric(variable)+offset, y=value+5, label=value)) +
+#   facet_grid(~Knockdown) +
+#   theme_few() +  theme(axis.text = element_text(colour = "black"), panel.border = element_rect(colour = "black"), legend.position = c(0.9, 0.9))
+# ggsave(gg, filename = file.path(working.folder, "images", "Figure3D.png"), dpi = 300, width = 10, height = 6)
+# ggsave(gg, filename = file.path(working.folder, "plots", "Figure3D.pdf"), device = cairo_pdf, dpi = 300, width = 10, height = 6)
+```
+
+![](images/Figure3D.png)
+
+```{r load_iCLIP_results}
+# sampleTable = data.table(Label=c(c("GTAGA", "CTGTA", "GTAAC", "ATCCA",
+#                                      "TATGA", "GGAGC", "AGTTA", "TCACA",
+#                                      "CATAC", "TCGCC", "CAGAA", "AGTCC"),
+#                                    c("dkc1-u2os-4su-1", "dkc1-u2os-x-1", "gar1-u2os-4su-0-4",
+#                                      "gar1-u2os-4su-1", "gar1-u2os-x-0-4", "gar1-u2os-x-1",
+#                                      "igg-u2os-4su-1-u-ml-rnasei-20180504-ju_", "igg-u2os-4su-1-u-ml-rnasei-20180504-ju-2",
+#                                      "igg-u2os-x-1-u-ml-rnasei-20180504-ju_", "igg-u2os-x-1-u-ml-rnasei-20180504-ju-2")),
+#                          Sample=c(c("IgG-DKC1_PARPi", "IgG-GAR1_UV", "IgG-DKC1_UV", "DKC1_PARPi",
+#                                     "GAR1_UV", "IgG-DKC1_noUV", "DKC1_UV", "IgG-GAR1_PARPi",
+#                                     "GAR1_noUV", "IgG-GAR1_noUV", "GAR1_PARPi", "DKC1_noUV"),
+#                                   c("DKC1_4SU-1", "DKC1_X-1", "GAR1_4SU-0.4", "GAR1_4SU-1",
+#                                     "GAR1_X-0.4", "GAR1_X-1",
+#                                     "IgG-DKC1_4SU-1", "IgG-GAR1_4SU-1",
+#                                     "IgG-DKC1_X-1", "IgG-GAR1_X-1")),
+#                          Batch=c(rep(1, 12), rep(2, 10)))
+# 
+# sampleTable[, c("Target", "Treatment") := tstrsplit(Sample, "_")]
+# 
+# sampleTable = sampleTable[order(Target, Treatment)]
+# 
+# # Subselect only sample that are used in this analysis
+# sampleTable = sampleTable[!Treatment%in%c("4SU-1", "PARPi", "UV", "4SU-0.4", "X-0.4"),]
+# 
+# files.iclip = list.files(file.path(clipseq.folder, "iCLIP"), pattern="*_single.bed.gz")
+# 
+# sampleTable[, File := grep(Label, files.iclip, value=TRUE), by="Sample"]
+
+sampleTable = data.table(File = list.files(file.path(clipseq.folder), pattern="single.bed.gz"))
+sampleTable[, c("Target", "Replicate") := tstrsplit(File, "_")[1:2]]
+sampleTable[, Sample := paste(Target, Replicate, sep="_")]
+
+if( !file.exists(file.path(working.folder, "RData", "iCLIP_all_reads_GRanges.rds")) ){
+  bed.iclip = lapply(sampleTable[, setNames(File, Sample)],
+                     function(x){
+                       tmp = fread(cmd = paste("gunzip -c", file.path(clipseq.folder, x)))
+                       tmp = with(tmp, GRanges(V1, IRanges(V2, width=1), V6, score = V5))
+                       tmp = keepSeqlevels(tmp, chromosomes, pruning.mode="coarse")
+                       seqinfo(tmp) = seqinfo(genes)[chromosomes]
+                       return(tmp)
+                     })
+  saveRDS(bed.iclip, file.path(working.folder, "RData", "iCLIP_all_reads_GRanges.rds"))
+}else{
+  message("Loading iCLIP reads...")
+  bed.iclip = readRDS(file.path(working.folder, "RData", "iCLIP_all_reads_GRanges.rds"))
+}
+bed.iclip = bed.iclip[order(names(bed.iclip))]
+
+intergenic.clip = lapply(bed.iclip, function(x) subsetByOverlaps(x, genes.regions, invert = TRUE))
+
+tab = data.table(as.data.frame(genes.regions)[6:9],
+                 sapply(bed.iclip, function(x) countOverlapsWeighted(genes.regions, x)))
+tab = melt.data.table(tab, id.vars = c("gene_id", "gene_type", "gene_name", "annotation"))
+
+tab = rbindlist(list(tab,
+                     as.data.table(sapply(intergenic.clip,
+                                          function(x)
+                                              sum(x$score)), keep.rownames = TRUE)[, .(gene_id="Intergenic", gene_type="Intergenic", gene_name="Intergenic",
+                                                                                       annotation="Intergenic", variable=V1, value=V2)]))
+tab[, fraction := value/sum(value), by="variable"]
+tab[, annotation := factor(gsub("other", "other annotated", gsub("_", " ", annotation)),
+                           levels=rev(c("protein coding", "long ncRNA", "ncRNA", "other annotated", "Intergenic")))]
+pl = tab[!grepl("IgG", variable), sum(fraction), by=c("variable", "annotation")]
+pl[, variable := tstrsplit(variable, "_")[[1]]]
+
+gg = ggplot(pl[, mean(V1), by=c("variable", "annotation")],
+       aes(x=variable, y=V1, fill=annotation)) +
+  geom_bar(position="stack", stat="identity", col="black") +
+  scale_x_discrete("iCLIP dataset") +
+  scale_y_continuous("Fraction of total reads") +
+  scale_fill_locuszoom() +
+  theme_bw() + theme(axis.text = element_text(colour = "black"), panel.border = element_rect(colour = "black"), legend.position = "top") +
+  guides(fill=guide_legend(title=element_blank(), reverse = TRUE))
+ggsave(gg, filename = file.path(working.folder, "images", "Figure_3B.png"), dpi = 300, width = 6, height = 6)
+ggsave(gg, filename = file.path(working.folder, "plots", "Figure_3B.pdf"), device = cairo_pdf, dpi = 300, width = 6, height = 6)
+```
+
+
+```{r}
+# gg = ggplot(tab[, sum(value)/1e6, by=c("variable", "annotation")],
+#        aes(x=variable, y=V1, fill=annotation)) +
+#   geom_bar(position="stack", stat="identity", col="black") +
+#   scale_x_discrete("iCLIP dataset") +
+#   scale_y_continuous("Number of reads (Millions)") +
+#   scale_fill_locuszoom() +
+#   theme_bw() + theme(axis.text = element_text(colour = "black"), panel.border = element_rect(colour = "black"), legend.position = "top") +
+#   guides(fill=guide_legend(title="Gene type", reverse = TRUE))
+# ggsave(gg, filename = file.path(working.folder, "images", "SupplFigure1B.png"), dpi = 300, width = 10, height = 6)
+# ggsave(gg, filename = file.path(working.folder, "plots", "SupplFigure1B.pdf"), device = cairo_pdf, dpi = 300, width = 10, height = 6)
+# 
+# pl = tab[!grepl("IgG", variable) & gene_type%in%c("rRNA", "snRNA", "snoRNA", "scaRNA"), sum(fraction), by=c("variable", "gene_type")]
+# pl[, c("Target", "Replicate") := tstrsplit(variable, "_")]
+# pl = pl[, .(V1 = mean(V1)), by=c("Target", "gene_type")]
+# # gg = ggplot(pl, aes(x=gene_type, y=V1, fill=Target)) +
+# #   geom_bar(position="dodge", stat="identity", col="black") +
+# #   scale_x_discrete("Biotype") +
+# #   scale_y_continuous("Fraction of total reads") +
+# #   scale_fill_lancet(alpha=0.75) + facet_wrap(~Target, scales="free_y", ncol=2) +
+# #   theme_few() + theme(axis.text = element_text(colour = "black"), panel.border = element_rect(colour = "black"), legend.position = "top") +
+# #   guides(fill=FALSE)
+# 
+# gg1 = ggplot(pl[gene_type%in%c("scaRNA", "snoRNA")], aes(x=gene_type, y=V1, fill=Target)) +
+#   geom_bar(position="dodge", stat="identity", col="black") +
+#   scale_x_discrete("Biotype") +
+#   scale_y_continuous("Fraction of total reads") +
+#   scale_fill_lancet(alpha=0.75) + facet_wrap(~Target, scales="free_y", ncol=1) +
+#   theme_few() + theme(axis.text = element_text(colour = "black"), panel.border = element_rect(colour = "black"), legend.position = "top") +
+#   guides(fill="none")
+# gg2 = ggplot(pl[gene_type%in%c("rRNA", "snRNA")], aes(x=gene_type, y=V1, fill=Target)) +
+#   geom_bar(position="dodge", stat="identity", col="black") +
+#   scale_x_discrete("Biotype") +
+#   scale_y_continuous("Fraction of total reads") +
+#   scale_fill_lancet(alpha=0.75) + facet_wrap(~Target, scales="free_y", ncol=1) +
+#   theme_few() + theme(axis.text = element_text(colour = "black"), panel.border = element_rect(colour = "black"), legend.position = "top") +
+#   guides(fill="none")
+# gg = ggarrange(gg1, gg2, ncol=2, nrow=1)
+# ggsave(gg, filename = file.path(working.folder, "images", "SupplFigure4B.png"), dpi = 300, width = 6, height = 8)
+# ggsave(gg, filename = file.path(working.folder, "plots", "SupplFigure4B.pdf"), device = cairo_pdf, dpi = 300, width = 6, height = 8)
+# 
+# # pl = tab[!grepl("IgG", variable) & gene_id!="Intergenic",]
+# # pl = pl[, .(value = sum(value)), by=c("gene_id", "gene_type", "gene_name", "annotation", "variable")]
+# # pl[, value := log10(value+1)]
+# # pl = dcast.data.table(pl, gene_id+gene_type+gene_name+annotation~variable, value.var = "value")
+# # pl = pl[rowSums(pl[, 5:ncol(pl), with=FALSE]>0)>1,]
+# # pl[, annotation := factor(annotation, levels=c("protein coding", "long ncRNA", "ncRNA", "other annotated"))]
+# # ggpairs(pl, columns = 5:ncol(pl), aes(col=annotation),
+# #         lower = list(continuous = wrap("points", size=0.25, alpha=0.1)),
+# #         diag = list(continuous = wrap("densityDiag", alpha=0.5, col="black")),
+# #         upper = list(continuous = wrap("cor", method="pearson", use="pairwise.complete.obs", col="black")))
+
+tab = data.table(as.data.frame(genes.regions)[6:9],
+                 sapply(bed.iclip, function(x) countToTPM(countOverlapsWeighted(genes.regions, x), genes.regions)))
+
+tab = melt.data.table(tab, id.vars = c("gene_id", "gene_type", "gene_name", "annotation"))
+
+tab[, annotation := factor(gsub("other", "other annotated", gsub("_", " ", annotation)),
+                           levels=rev(c("protein coding", "long ncRNA", "ncRNA", "other annotated", "Intergenic")))]
+
+tab = tab[, .(value = sum(value)), by=c(names(tab)[1:5])]
+
+tab2 = copy(gene_expression)
+setkey(tab2, gene_id)
+
+setkey(tab, gene_id)
+tab = tab[tab2, nomatch=0][TPM>0]
+
+tab[, normalised := value/TPM]
+
+pl = tab[!grepl("IgG", variable), sum(normalised), by=c("variable", "annotation")]
+pl[, Fraction := V1/sum(V1), by="variable"]
+pl[, variable := tstrsplit(variable, "_")[[1]]]
+
+gg = ggplot(pl[, .(Fraction = mean(Fraction)), by=c("variable", "annotation")],
+       aes(x=variable, y=Fraction, fill=annotation)) +
+  geom_bar(position="stack", stat="identity", col="black") +
+  scale_x_discrete("iCLIP dataset") +
+  scale_y_continuous("Fraction of total reads") +
+  scale_fill_locuszoom() +
+  theme_bw() + theme(axis.text = element_text(colour = "black"), panel.border = element_rect(colour = "black"), legend.position = "top") +
+  guides(fill=guide_legend(title=element_blank(), reverse = TRUE))
+ggsave(gg, filename = file.path(working.folder, "images", "Figure_S4H.png"), dpi = 300, width = 6, height = 6)
+ggsave(gg, filename = file.path(working.folder, "plots", "Figure_S4H.pdf"), device = cairo_pdf, dpi = 300, width = 6, height = 6)
+```
+
+
+```{r}
+tab = data.table(as.data.frame(genes.regions)[6:9],
+                 sapply(bed.iclip, function(x) countToTPM(countOverlapsWeighted(genes.regions, x), genes.regions)))
+tab = melt.data.table(tab[annotation=="ncRNA" & gene_id%in%expressed_genes[, gene_id],], id.vars = c("gene_id", "gene_type", "gene_name", "annotation"))
+
+pl = tab[!grepl("IgG", variable), .SD[value>1, .N], by=c("gene_type", "variable")]
+setkey(pl, "gene_type")
+
+tab2 = gene.metadata[gene_group=="ncRNA" & gene_id%in%expressed_genes[, gene_id], .N, by="gene_type"]
+setkey(tab2, "gene_type")
+
+pl = pl[tab2,, nomatch=0][grepl("scaRNA|snoRNA", gene_type),]
+pl[, variable := tstrsplit(variable, "_")[[1]]]
+
+pl = pl[, .(V1 = mean(V1), N = unique(N), Fraction = mean(V1/N)), by=c("variable", "gene_type")]
+
+pl = pl[order(-N),][, gene_type := factor(gene_type, levels=unique(gene_type))]
+
+gg = ggplot(pl[order(gene_type),], aes(x=gene_type, y=V1, fill=gene_type)) +
+  geom_bar(stat="identity", position="identity", col="black") +
+  facet_grid(~variable) +
+  geom_text(aes(label=scales::percent(Fraction)), vjust = -0.5) +
+  geom_text(aes(y = 0, label=paste(V1, N, sep="/")), vjust = -0.5) +
+  theme_pubr() + theme(strip.background=element_blank()) + labs(x="", y="Expressed ncRNAs bound") + guides(fill = "none")
+ggsave(gg, filename = file.path(working.folder, "images", "Figure_S4A.png"), dpi = 300, width = 6, height = 6)
+ggsave(gg, filename = file.path(working.folder, "plots", "Figure_S4A.pdf"), device = cairo_pdf, dpi = 300, width = 6, height = 6)
+```
+
+![](images/Figure_S4A.png)
+
+```{r}
+longest_transcripts = txs.metadata[order(-width),][!duplicated(gene_id), transcript_id]
+longest_transcripts = exonsBy(TxDb, by = "tx", use.names=TRUE)[longest_transcripts]
+tab = lapply(bed.iclip[1:4], function(x) data.table(txs.metadata[match(names(longest_transcripts), transcript_id),],
+                                                    count = countOverlapsWeighted(longest_transcripts, x), tx_width = sum(width(longest_transcripts)), total = sum(x$score)))
+for( i in seq_along(tab) ){
+  tab[[i]][, norm := count/total*1e6/tx_width*1e3]
+  tab[[i]] = tab[[i]][count>0,]
+}
+
+# pl = rbindlist(tab, idcol="sample")
+# pl[, norm := log10(norm)]
+# pl = dcast.data.table(pl, gene_id+gene_type+gene_name~sample, value.var = "norm", fill=NA)
+# setkey(pl, gene_id)
+# pl[gene.metadata, gene_group := factor(gene_group, levels=c("protein_coding", "long_ncRNA", "ncRNA", "other"))]
+#
+# gg = ggpairs(pl, columns = 4:7, aes(col=gene_group, fill=gene_group),
+#         lower = list(continuous = wrap("points", size=0.5, alpha=0.25)),
+#         diag = list(continuous = wrap("densityDiag", alpha=0.5, col="black")),
+#         upper = list(continuous = wrap("cor", method="pearson", use="pairwise.complete.obs"))) +
+#   scale_colour_manual(values = rev(pal_locuszoom()(5))) +
+#   scale_fill_manual(values = rev(pal_locuszoom()(5))) +
+#   theme_few()
+# save_plot(gg, filename = file.path(working.folder, "images", "SupplFigure4A.png"), ncol=4, nrow=4, base_height = 3, base_asp = 1.1)
+# save_plot(gg, filename = file.path(working.folder, "plots", "SupplFigure4A.pdf"), device = cairo_pdf, ncol=4, nrow=4, base_height = 3, base_asp = 1.1)
+
+pl = rbindlist(tab, idcol="sample")
+pl[, target := tstrsplit(sample, "_")[[1]]]
+pl = pl[, .(norm = mean(norm)), by=c("target", "gene_id", "gene_type", "gene_name")]
+pl[, norm := log10(norm)]
+pl = dcast.data.table(pl, gene_id+gene_type+gene_name~target, value.var = "norm", fill=NA)
+setkey(pl, gene_id)
+pl[gene.metadata, gene_group := factor(gene_group, levels=c("protein_coding", "long_ncRNA", "ncRNA", "other"))]
+
+limitRange <- function(data, mapping, ...) { 
+  ggplot(data = data, mapping = mapping, ...) + 
+    geom_abline(intercept=0, slope=1, linetype="dashed", col="grey75") +
+    geom_point(size=0.5, alpha=0.25) + 
+    scale_y_continuous(limits = c(-2.5, 5.5)) +
+    scale_x_continuous(limits = c(-2.5, 5.5)) 
+}
+
+my_dens <- function(data, mapping, ..., low = "#132B43", high = "#56B1F7") {
+  ggplot(data = data, mapping=mapping) +
+    geom_density(alpha=0.5, size=1) +
+    scale_x_continuous(limits = c(-2.5, 5.5)) 
+}
+
+gg = ggpairs(pl, columns = 4:5, aes(col=gene_group, group=gene_group),
+        lower = list(continuous = limitRange),
+        diag = list(continuous = my_dens),
+        upper = list(continuous = wrap("cor", method="pearson", use="pairwise.complete.obs"))) +
+  scale_colour_manual(values = rev(pal_lancet()(5))) +
+  scale_fill_manual(values = rev(pal_lancet()(5))) +
+  theme_few()
+save_plot(gg, filename = file.path(working.folder, "images", "Figure_3A.png"), ncol=2, nrow=2, base_height = 2.5, base_asp = 1.1)
+save_plot(gg, filename = file.path(working.folder, "plots", "Figure_3A.pdf"), device = cairo_pdf, ncol=2, nrow=2, base_height = 2.5, base_asp = 1.1)
+```
+
+![](images/Figure_3A.png)
+
+```{r}
+setkey(gene_expression, gene_id)
+pl[gene_expression, TPM := TPM]
+pl[is.na(DKC1), DKC1 := -Inf][is.na(GAR1), GAR1 := -Inf]
+pl = pl[order(-TPM),]
+
+pl2 = pl[gene_group=="protein_coding", .(TPM, I=.I, DKC1, GAR1,
+                                         CDF_DKC1 = cumsum(DKC1>=.SD[order(-DKC1) & DKC1>-Inf, quantile(DKC1, 0.95)])/sum(DKC1>=.SD[order(-DKC1) & DKC1>-Inf, quantile(DKC1, 0.95)]),
+                                         CDF_GAR1 = cumsum(GAR1>=.SD[order(-GAR1) & GAR1>-Inf, quantile(GAR1, 0.95)])/sum(GAR1>=.SD[order(-GAR1) & GAR1>-Inf, quantile(GAR1, 0.95)]))]
+gg = ggplot(melt.data.table(pl2, id.vars="I", measure.vars=c("CDF_DKC1", "CDF_GAR1")), aes(x=I, y=value, col=gsub("CDF_", "", variable))) +
+  geom_abline(intercept = 0, slope = 1/nrow(pl2), linetype="dashed") +
+  geom_line(lwd=1) + scale_colour_lancet(name="") +
+  geom_rug(data = pl2[!duplicated(CDF_DKC1) & DKC1>-Inf,], aes(x=I), sides="b", col=pal_lancet()(2)[1], size=0.1, inherit.aes=FALSE) +
+  geom_rug(data = pl2[!duplicated(CDF_GAR1) & GAR1>-Inf,], aes(x=I), sides="t", col=pal_lancet()(2)[2], size=0.1, inherit.aes=FALSE) +
+  scale_x_continuous("Transcripts ranked by TPM expression") +
+  scale_y_continuous("Protein bound transcripts (CDF)") +
+  theme_few() + coord_fixed(ratio=15000) + theme(legend.position=c(0.8, 0.2))
+ggsave(gg, filename = file.path(working.folder, "images", "Figure_3E.png"), dpi = 300, width = 6, height = 6)
+ggsave(gg, filename = file.path(working.folder, "plots", "Figure_3E.pdf"), device = cairo_pdf, dpi = 300, width = 6, height = 6)
+```
+
+![](images/Figure_3E.png)
+
+```{r}
+# USER_ACTION: Download the repeatMasker annotation file, place into the annotation path and correct the following statement:
+repeats = fread(cmd=paste("gunzip -c", file.path(annotation.folder, "hg38_repeatMasker.tsv.gz")))
+
+repeats = with(repeats, GRanges(`#genoName`, IRanges(genoStart, genoEnd), strand, repClass, repFamily, repName))
+repeats = keepSeqlevels(repeats, chromosomes, pruning.mode="coarse")
+```
+
+
+```{r}
+tab = data.table(as.data.frame(genes.regions)[6:9],
+                 sapply(bed.iclip, function(x) countToTPM(countOverlapsWeighted(genes.regions, x), genes.regions)))
+pl = melt.data.table(tab[annotation=="ncRNA" & gene_id%in%expressed_genes[, gene_id],], id.vars = c("gene_id", "gene_type", "gene_name", "annotation"))
+pl = pl[!grepl("IgG", variable),]
+pl[, Protein := tstrsplit(variable, "_")[[1]]]
+ncRNA_sel = pl[gene_type%in%c("snoRNA", "scaRNA"), .(value = mean(value)), by=c("Protein", "gene_id")]
+
+genes.selected = genes.pc.granges[expressed_genes[gene_id%in%names(genes.pc.granges) & TPM>=1, gene_id]]
+exons.selected = reduce(exonsByGene[names(genes.selected)])
+
+stopifnot( identical(names(genes.selected), names(exons.selected)) )
+
+tab = data.table(as.data.frame(genes.selected),
+                 as.data.table(lapply(bed.iclip[1:4],
+                                function(x)
+                                  (countOverlapsWeighted(exons.selected, x))/sum(width(exons.selected))*1e3/sum(x$score)*1e6)))
+
+tab[, withRNA := overlapsAny(GRanges(tab), GRanges(gene.metadata[gene_id%in%ncRNA_sel[Protein=="DKC1" & value>1, gene_id]]), ignore.strand=TRUE)]
+
+tab2 = data.table(as.data.frame(repeats),
+           DKC1 = rowMeans(sapply(bed.iclip[1:2], function(x) countOverlapsWeighted(repeats, x)/sum(x$score)*1e6)),
+           DKC1_Up = rowMeans(sapply(bed.iclip[1:2], function(x) countOverlapsWeighted(flank(repeats, width=width(repeats), start=TRUE, both=FALSE), x)/sum(x$score)*1e6)),
+           DKC1_Down = rowMeans(sapply(bed.iclip[1:2], function(x) countOverlapsWeighted(flank(repeats, width=width(repeats), start=FALSE, both=FALSE), x)/sum(x$score)*1e6)),
+           GAR1 = rowMeans(sapply(bed.iclip[3:4], function(x) countOverlapsWeighted(repeats, x)/sum(x$score)*1e6)),
+           GAR1_Up = rowMeans(sapply(bed.iclip[3:4], function(x) countOverlapsWeighted(flank(repeats, width=width(repeats), start=TRUE, both=FALSE), x)/sum(x$score)*1e6)),
+           GAR1_Down = rowMeans(sapply(bed.iclip[3:4], function(x) countOverlapsWeighted(flank(repeats, width=width(repeats), start=FALSE, both=FALSE), x)/sum(x$score)*1e6)))
+
+
+pl = tab2[overlapsAny(GRanges(tab2), genes) & !overlapsAny(GRanges(tab2), exonsByGene) & DKC1>0,]
+pl = melt.data.table(pl[DKC1/width*1000>1,], id.vars = c("seqnames", "start", "end", "width", "repFamily"), measure.vars = c("DKC1", "DKC1_Up", "DKC1_Down"))
+pl[, variable := factor(variable, levels=c("DKC1_Up", "DKC1", "DKC1_Down"))]
+
+tab[, withRepeats := overlapsAny(GRanges(tab), GRanges(pl[variable=="DKC1" & repFamily%in%c("Alu", "L1") & value>1]), ignore.strand=FALSE)]
+
+tab[, `:=`(DKC1_Avg = (DKC1_rep1+DKC1_rep2)/2, GAR1_Avg = (GAR1_rep1+GAR1_rep2)/2)]
+
+tab[, TPM := expressed_genes[match(tab[, gene_id], gene_id), TPM]]
+
+# upset(tab, intersect=c("withscaRNA", "withsnoRNA", "withLINE", "withAlu"))
+
+tab[, Bound := ifelse(DKC1_Avg>1, TRUE, FALSE)]
+gg = ggplot(tab[, c("Bound", "withRNA", "withRepeats")], aes(A = Bound, B = withRNA, C = withRepeats)) +
+    geom_venn() +
+    theme_void() +
+    coord_fixed()
+ggsave(gg, filename = file.path(working.folder, "images", "Figure_S4G1.png"), units = "in", width = 6, height = 6, dpi = 300)
+ggsave(gg, filename = file.path(working.folder, "plots", "Figure_S4G1.pdf"), width = 6, height = 6, device = cairo_pdf)
+
+# GAR1
+tab = data.table(as.data.frame(genes.selected),
+                 as.data.table(lapply(bed.iclip[1:4],
+                                function(x)
+                                  (countOverlapsWeighted(exons.selected, x))/sum(width(exons.selected))*1e3/sum(x$score)*1e6)))
+
+tab[, withRNA := overlapsAny(GRanges(tab), GRanges(gene.metadata[gene_id%in%ncRNA_sel[Protein=="GAR1" & value>1, gene_id]]), ignore.strand=TRUE)]
+
+tab2 = data.table(as.data.frame(repeats),
+           DKC1 = rowMeans(sapply(bed.iclip[1:2], function(x) countOverlapsWeighted(repeats, x)/sum(x$score)*1e6)),
+           DKC1_Up = rowMeans(sapply(bed.iclip[1:2], function(x) countOverlapsWeighted(flank(repeats, width=width(repeats), start=TRUE, both=FALSE), x)/sum(x$score)*1e6)),
+           DKC1_Down = rowMeans(sapply(bed.iclip[1:2], function(x) countOverlapsWeighted(flank(repeats, width=width(repeats), start=FALSE, both=FALSE), x)/sum(x$score)*1e6)),
+           GAR1 = rowMeans(sapply(bed.iclip[3:4], function(x) countOverlapsWeighted(repeats, x)/sum(x$score)*1e6)),
+           GAR1_Up = rowMeans(sapply(bed.iclip[3:4], function(x) countOverlapsWeighted(flank(repeats, width=width(repeats), start=TRUE, both=FALSE), x)/sum(x$score)*1e6)),
+           GAR1_Down = rowMeans(sapply(bed.iclip[3:4], function(x) countOverlapsWeighted(flank(repeats, width=width(repeats), start=FALSE, both=FALSE), x)/sum(x$score)*1e6)))
+
+
+pl = tab2[overlapsAny(GRanges(tab2), genes) & !overlapsAny(GRanges(tab2), exonsByGene) & GAR1>0,]
+pl = melt.data.table(pl[GAR1/width*1000>1,], id.vars = c("seqnames", "start", "end", "width", "repFamily"), measure.vars = c("GAR1", "GAR1_Up", "GAR1_Down"))
+pl[, variable := factor(variable, levels=c("GAR1_Up", "GAR1", "GAR1_Down"))]
+
+tab[, withRepeats := overlapsAny(GRanges(tab), GRanges(pl[variable=="GAR1" & repFamily%in%c("Alu", "L1") & value>1]), ignore.strand=FALSE)]
+
+tab[, `:=`(DKC1_Avg = (DKC1_rep1+DKC1_rep2)/2, GAR1_Avg = (GAR1_rep1+GAR1_rep2)/2)]
+
+tab[, TPM := expressed_genes[match(tab[, gene_id], gene_id), TPM]]
+
+# upset(tab, intersect=c("withscaRNA", "withsnoRNA", "withLINE", "withAlu"))
+
+tab[, Bound := ifelse(GAR1_Avg>1, TRUE, FALSE)]
+gg = ggplot(tab[, c("Bound", "withRNA", "withRepeats")], aes(A = Bound, B = withRNA, C = withRepeats)) +
+    geom_venn() +
+    theme_void() +
+    coord_fixed()
+ggsave(gg, filename = file.path(working.folder, "images", "Figure_S4G2.png"), units = "in", width = 6, height = 6, dpi = 300)
+ggsave(gg, filename = file.path(working.folder, "plots", "Figure_S4G2.pdf"), width = 6, height = 6, device = cairo_pdf)
+```
+
+
+```{r}
+require("BSgenome.Hsapiens.UCSC.hg38")
+require("Rsamtools")
+require("GenomicAlignments")
+
+gr_chrom = GRanges(keepStandardChromosomes(seqinfo(BSgenome.Hsapiens.UCSC.hg38)))
+
+# USER_ACTION: Add the paths to the BAM files to the following statement:
+sampleTable[, BamFile := list.files() ]
+
+if( !file.exists(file.path(working.folder, "RData", "iclip_filtered_reads.rds")) ){
+    iclip = lapply(sampleTable[, setNames(BamFile, Sample)],
+                   function(x){
+                       
+                       bamFile = BamFile(file.path(x))
+                       
+                       params = ScanBamParam(flag = scanBamFlag(isUnmappedQuery = FALSE, isSecondaryAlignment = FALSE),
+                                              simpleCigar = FALSE, mapqFilter=255, which = gr_chrom,
+                                              what = c("qname", "rname", "strand", "pos", "qwidth", "mapq", "cigar"))
+                       
+                       aln = scanBam(bamFile, param = params)
+                       
+                       aln = rbindlist(lapply(aln, as.data.table))
+                       
+                       aln[, umi := tstrsplit(qname, ":")[[9]]]
+                       setkeyv(aln, c("rname", "strand", "pos", "umi"))
+                       
+                       aln = unique(aln, by=key(aln))
+                       
+                       return(aln)
+                   })
+    saveRDS(iclip, file = file.path(working.folder, "RData", "iclip_filtered_reads.rds"))
+} else {
+    
+    iclip = readRDS(file.path(working.folder, "RData", "iclip_filtered_reads.rds"))
+}
+
+iclip_intact = lapply(iclip,
+   function(x)
+      with(x[!grepl("N", cigar),], GAlignments(seqnames=factor(rname), pos=as.integer(pos), cigar=cigar, strand=factor(strand, levels=c("+", "-", "*")), names=qname)))
+iclip_spliced = lapply(iclip,
+   function(x)
+      with(x[grepl("N", cigar), ], GAlignments(seqnames=factor(rname), pos=as.integer(pos), cigar=cigar, strand=factor(strand, levels=c("+", "-", "*")), names=qname)))
+
+iclip_intact  = lapply(iclip_intact, function(x) as(x, "GRangesList"))
+iclip_spliced = lapply(iclip_spliced, function(x) as(x, "GRangesList"))
+
+saveRDS(iclip_intact,  file = file.path(working.folder, "RData", "iclip_filtered_reads_intact_grl.rds"))
+saveRDS(iclip_spliced, file = file.path(working.folder, "RData", "iclip_filtered_reads_spliced_grl.rds"))
+
+introns = intronsByTranscript(TxDb)
+introns_dt = unique(unlist(introns, use.names=TRUE))
+introns_dt$tx_id = names(introns_dt)
+names(introns_dt) = NULL
+introns_dt = data.table(as.data.frame(introns_dt))
+introns = unique(unlist(introns))
+
+# te = unlist(iclip_spliced[[1]][20])
+# test = unique(subsetByOverlaps(unlist(introns), GRanges("chr1", IRanges(925921,925959))))
+# 
+# te = unlist(iclip_spliced[[1]]["K00102:250:HWCW3BBXX:1:2120:15666:38556:rbc:AACTTTT",])
+# test = unique(subsetByOverlaps(unlist(introns), GRanges("chr1", IRanges(502190,502470))))
+
+countSplicedOverlaps = function(regions, reads){
+   reads_tmp = reads[strand(reads)=="+",]
+   cnt = countOverlaps(promoters(regions, 1, 0), reads_tmp, type="end")
+   cnt = cnt + countOverlaps(invertStrand(promoters(invertStrand(regions), 1, 0)), reads_tmp,  type="start")
+   
+   reads_tmp = reads[strand(reads)=="-",]
+   cnt = cnt + countOverlaps(promoters(regions, 1, 0), reads_tmp, type="start")
+   cnt = cnt + countOverlaps(invertStrand(promoters(invertStrand(regions), 1, 0)), reads_tmp, type="end")
+   
+   return(cnt)
+   }
+
+ExonIntronCounts = lapply(setNames(names(iclip_intact), names(iclip_intact)),
+   function(x){
+      name = as.character(x)
+      dt = data.table(introns_dt,
+         Ex = countSplicedOverlaps(introns, unlist(iclip_spliced[[name]])),
+         Is = countOverlaps(flank(introns, width=3, both=TRUE, start=TRUE), unlist(iclip_intact[[name]]), minoverlap=4),
+         Ie = countOverlaps(flank(introns, width=3, both=TRUE, start=FALSE), unlist(iclip_intact[[name]]), minoverlap=4))
+      return(dt)
+   })
+
+tab = lapply(ExonIntronCounts, function(x) x[, .(Ex = sum(Ex), Is = sum(Is), Ie = sum(Ie))])
+tab = rbindlist(tab, idcol="Exp")[, .(Ratio=log2((Ex)/(Is+Ie))), by="Exp"]
+tab = tab[!grepl("IgG", Exp),]
+tab[, Label := tstrsplit(Exp, "_")[[1]]]
+
+gg = ggplot(tab[, .(Ratio = mean(Ratio)), by="Label"], aes(x=Label, y=Ratio, fill=Label)) +
+   geom_hline(yintercept=0, linetype="dashed", col="grey25") +
+   geom_bar(stat="identity", position="identity", col="grey25", width=0.6) +
+   scale_fill_tableau(palette="Tableau 10") + scale_y_continuous(limits=c(-0.8, 0.8), breaks=seq(-0.75, 0.75, 0.25)) +
+   theme_few() + guides(fill=FALSE) + labs(x="", y=expression(paste("Internal exon-exon junctions Splicing Index: ", log[2](2*ExEx/(ExIn+InEx))))) + theme(axis.text = element_text(colour = "black"), panel.border = element_rect(colour = "black"))
+ggsave(gg, filename = file.path(working.folder, "images", "Figure_3F.png"), dpi = 300, width = 6, height = 6)
+ggsave(gg, filename = file.path(working.folder, "plots", "Figure_3F.pdf"), device = cairo_pdf, dpi = 300, width = 6, height = 6)
+```
+
+![](images/Figure_3F.png)
+
+```{r load_iCount_results}
+# Peaks analysis
+sampleTable[, Peaks := sapply(Sample, function(x) grep(paste0("^", x), list.files(clipseq.folder, pattern="scores.tsv.gz"), value=TRUE))]
+
+if( !file.exists(file.path(working.folder, "RData", "iCLIP_all_peaks_GRanges.rds")) ){
+  bed.peaks = lapply(sampleTable[, setNames(Peaks, Sample)],
+                     function(x){
+                       tmp = fread(cmd = paste("gunzip -c", file.path(clipseq.folder, x)))
+                       tmp = with(tmp[FDR<0.05,], GRanges(chrom, IRanges(position, width=1), strand, score, FDR))
+                       tmp = keepSeqlevels(tmp, chromosomes, pruning.mode="coarse")
+                       return(tmp)
+                     })
+  saveRDS(bed.peaks, file.path(working.folder, "RData", "iCLIP_all_peaks_GRanges.rds"))
+}else{
+  message("Loading iCLIP peaks...")
+  bed.peaks = readRDS(file.path(working.folder, "RData", "iCLIP_all_peaks_GRanges.rds"))
+}
+
+bed.peaks = bed.peaks[order(names(bed.peaks))]
+
+# tab = data.table(as.data.frame(genes.regions)[6:9],
+#                  sapply(bed.peaks, function(x) countOverlapsWeighted(genes.regions, x)))
+# tab = melt.data.table(tab, id.vars = c("gene_id", "gene_type", "gene_name", "annotation"))
+# tab[, fraction := value/sum(value), by="variable"]
+# 
+# # ggplot(tab[, sum(fraction), by=c("variable", "annotation")],
+# #        aes(x=variable, y=V1, fill=annotation0)) +
+# #   geom_bar(position="stack", stat="identity", col="grey30") +
+# #   scale_y_continuous("Fraction of reads", labels=percent) +
+# #   coord_flip()
+# 
+# # tab[, variable := gsub("X-", "X", gsub("SU-", "SU", variable))]
+# tab_clip = tab[!grepl("IgG", variable),]
+# tab_IgG  = tab[grepl("IgG", variable),]
+# tab_IgG[, variable := gsub("IgG-", "", variable)]
+# 
+# tab_clip = tab_clip[, sum(value), by=c("variable", "gene_type")]
+# tab_IgG = tab_IgG[, sum(value), by=c("variable", "gene_type")]
+# setkeyv(tab_clip, c("variable", "gene_type"))
+# setkeyv(tab_IgG, c("variable", "gene_type"))
+# 
+# tab_clip = tab_clip[tab_IgG, .(variable, gene_type, V1, i.V1, Ratio = log2(V1/(i.V1+1)))]
+# tab_clip = tab_clip[gene_type%in%c("protein_coding", "lincRNA", "antisense", "processed_transcript", "pseudogenes", "miscRNA", "miRNA", "snRNA", "snoRNA", "scaRNA", "rRNA")]
+# 
+# tab_clip[, c("Protein", "Condition") := tstrsplit(variable, "_")]
+# tab_clip[, gene_type := factor(gene_type, levels=rev(c("protein_coding", "lincRNA", "antisense", "processed_transcript",
+#                                                    "pseudogenes", "miscRNA", "miRNA", "snRNA", "snoRNA", "scaRNA", "rRNA")))]
+# 
+# gg = ggplot(tab_clip, aes(x=gene_type, y=Ratio, fill=Condition)) +
+#   geom_bar(position="dodge", stat="identity", col="grey30") +
+#   scale_fill_tableau(palette="Tableau 10") +
+#   scale_x_discrete("") +
+#   scale_y_continuous("Log2 enrichment over control") +
+#   coord_flip() + facet_wrap(~Protein, ncol=5) +
+#   theme_calc()
+# ggsave(gg, filename = file.path(working.folder, "images", "iCLIP_Log2EnrichmentOverControl.png"), units = "in", width = 8, height = 8, dpi = 300)
+# ggsave(gg, filename = file.path(working.folder, "plots", "iCLIP_Log2EnrichmentOverControl.pdf"), width = 8, height = 8, device = cairo_pdf)
+
+# Cluster analysis
+sampleTable[, Clusters := sapply(Sample, function(x) grep(paste0("^", x), list.files(clipseq.folder, pattern="clusters.bed.gz"), value=TRUE))]
+
+if( !file.exists(file.path(working.folder, "RData", "iCLIP_all_clusters_GRanges.rds")) ){
+  bed.clusters = lapply(sampleTable[, setNames(Clusters, Sample)],
+                        function(x){
+                          tmp = fread(cmd = paste("gunzip -c", file.path(clipseq.folder, x)))
+                          tmp = with(tmp, GRanges(V1, IRanges(V2, V3), V6, score = V5))
+                          tmp = keepSeqlevels(tmp, chromosomes, pruning.mode="coarse")
+                          return(tmp)
+                        })
+  saveRDS(bed.clusters, file.path(working.folder, "RData", "iCLIP_all_clusters_GRanges.rds"))
+}else{
+  message("Loading iCLIP clusters...")
+  bed.clusters = readRDS(file.path(working.folder, "RData", "iCLIP_all_clusters_GRanges.rds"))
+}
+
+bed.clusters = bed.clusters[order(names(bed.clusters))]
+
+# # dkc1.clusters = bed.clusters[[5]][overlapsAny(bed.clusters[[5]], bed.clusters[[4]], maxgap = 10)]
+# # dkc1.clusters = dkc1.clusters[!overlapsAny(dkc1.clusters, c(bed.clusters[[16]], bed.clusters[[17]]), maxgap = 10)]
+# dkc1.clusters = setdiff(intersect(bed.clusters[["DKC1_rep1"]], bed.clusters[["DKC1_rep2"]]), c(bed.clusters[["IgG-DKC1_rep1"]], bed.clusters[["IgG-DKC1_rep2"]]))
+# # dkc1.clusters = intersect(bed.clusters[["DKC1_rep1"]], bed.clusters[["DKC1_rep2"]])
+# # dkc1.clusters = dkc1.clusters[!overlapsAny(dkc1.clusters, c(bed.clusters[["IgG-DKC1_rep1"]], bed.clusters[["IgG-DKC1_rep2"]]))]
+# 
+# # gar1.clusters = bed.clusters[[13]][overlapsAny(bed.clusters[[13]], bed.clusters[[12]], maxgap = 10)]
+# # gar1.clusters = gar1.clusters[!overlapsAny(gar1.clusters, c(bed.clusters[[21]], bed.clusters[[22]]), maxgap = 10)]
+# gar1.clusters = setdiff(intersect(bed.clusters[["GAR1_rep1"]], bed.clusters[["GAR1_rep2"]]), c(bed.clusters[["IgG-GAR1_rep1"]], bed.clusters[["IgG-GAR1_rep2"]]))
+# 
+# pl = rbindlist(lapply(list(DKC1=dkc1.clusters, GAR1=gar1.clusters),
+#             function(x){
+#               overlaps = as.data.table(findOverlaps(x, genes.regions))
+#               overlaps[, coverage := width(pintersect(x[queryHits,], genes.regions[subjectHits,]))]
+#               overlaps[, `:=`(annotation = genes.regions[subjectHits,]$annotation, type = genes.regions[subjectHits,]$type)]
+#               overlaps = overlaps[, .(coverage = sum(coverage)), by=c("annotation", "type")]
+#               return(overlaps)
+#             }), idcol="Protein")
+# 
+# pl[, fraction := coverage/sum(coverage), by="Protein"]
+# 
+# ggplot(pl[, sum(fraction), by=c("Protein", "annotation")],
+#        aes(x=Protein, y=V1, fill=annotation)) +
+#   geom_bar(position="stack", stat="identity", col="grey30") +
+#   scale_y_continuous("Fraction of reads", labels=percent) +
+#   coord_flip()
+
+
+
+# # sig.clusters = list(DKC1 = dkc1.clusters, GAR1 = gar1.clusters)
+# sig.clusters = bed.clusters
+# sig.reads = lapply(setNames(names(bed.clusters), names(bed.clusters)),
+#                    function(x)
+#                      subsetByOverlaps(bed.iclip[[as.character(x)]], bed.clusters[[as.character(x)]]))
+# # sig.reads = list(DKC1 = c(subsetByOverlaps(bed.iclip[[4]], dkc1.clusters), subsetByOverlaps(bed.iclip[[5]], dkc1.clusters)),
+# #                  GAR1 = c(subsetByOverlaps(bed.iclip[[12]], gar1.clusters), subsetByOverlaps(bed.iclip[[13]], gar1.clusters)))
+# 
+# tab = data.table(as.data.frame(genes.regions)[6:10],
+#                  sapply(sig.reads, function(x) countOverlapsWeighted(genes.regions, resize(x, 1, fix="center"))))
+# tab = melt.data.table(tab, id.vars = c("gene_id", "gene_type", "gene_name", "annotation", "type"))
+# tab[, normalised := value/sum(value), by="variable"]
+# 
+# gg = ggplot(tab[, sum(normalised), by=c("variable", "annotation")],
+#             aes(x=variable, y=V1, fill=annotation)) +
+#   geom_bar(position="stack", stat="identity", col="grey25") +
+#   scale_x_discrete("") +
+#   scale_y_continuous("Fraction of clusters", labels=percent) +
+#   scale_fill_tableau(palette="Tableau 10") +
+#   coord_flip() + theme_pubclean() + guides(fill=guide_legend(title="", ncol=2)) +
+#   theme(axis.text = element_text(colour="black"), panel.grid.major = element_blank(), axis.ticks.y = element_blank())
+# ggsave(gg, filename = file.path(working.folder, "images", "iCLIP_FractionOfReads.png"), units = "in", width = 5, height = 3, dpi = 300)
+# ggsave(gg, filename = file.path(working.folder, "plots", "iCLIP_FractionOfReads.pdf"), width = 5, height = 3, device = cairo_pdf)
+# 
+# tab = tab[type=="intron", .(normalised = sum(normalised)), by=c("variable", "gene_id", "annotation")][normalised>0 & annotation=="protein_coding",]
+# setkey(tab, gene_id)
+# 
+# overlaps = as.data.table(overlapsAny(genes.pc.granges[genes.pc.granges$gene_id%in%tab[, gene_id]],
+#                        genes[genes$gene_id%in%geneBT[["snoRNA"]]], ignore.strand=TRUE))
+# overlaps[, gene_id := names(genes.pc.granges[genes.pc.granges$gene_id%in%tab[, gene_id]])]
+# setkey(overlaps, gene_id)
+# 
+# tab = tab[overlaps, nomatch=0]
+# 
+# pl = tab[, .N, by=c("variable", "V1")][, .(V1, N, P = N/sum(N)), by="variable"]
+# 
+# gg = ggplot(pl, aes(x=variable, y=P, fill=V1)) +
+#   geom_bar(stat="identity", position="stack", col="grey25") +
+#   geom_text(data=pl[V1==TRUE,], aes(y=P/2, label=N)) +
+#   scale_y_continuous("Percentage of bound proiten-coding genes", labels=percent) +
+#   scale_fill_jco() +
+#   theme_pubr() + xlab("") + guides(fill=guide_legend(title="Contains snoRNA", reverse = TRUE))
+# ggsave(gg, filename = file.path(working.folder, "images", "iCLIP_BoundProteinCodingAndSnoRNA_percentage.png"), units = "in", width = 10, height = 6, dpi = 300)
+# ggsave(gg, filename = file.path(working.folder, "plots", "iCLIP_BoundProteinCodingAndSnoRNA_percentage.pdf"), width = 10, height = 6, device = cairo_pdf)
+# 
+# pl = tab[order(-normalised)]
+# pl[, N := seq_along(V1), by="variable"][, `:=`(P = N/.N, C = cumsum(V1)), by="variable"]
+# gg = ggplot(pl, aes(x=P, y=C, col=variable)) +
+#   geom_line() +
+#   scale_x_continuous("Fraction of bound protein-coding RNAs") +
+#   scale_y_continuous("snoRNA in bound protein-coding genes") +
+#   scale_colour_jco() +
+#   theme_bw() + theme(legend.position = c(0.2, 0.8), legend.background = element_blank()) + guides(colour=guide_legend(title=""))
+# save_plot(gg, filename = file.path(working.folder, "images", "iCLIP_BoundProteinCodingAndSnoRNA.png"), units = "in", base_height = 6, base_aspect_ratio = 1, dpi = 300)
+# save_plot(gg, filename = file.path(working.folder, "plots", "iCLIP_BoundProteinCodingAndSnoRNA.pdf"), base_height = 6, base_aspect_ratio = 1, device = cairo_pdf)
+# 
+# pl = tab[order(-normalised),]
+# pl[, N := seq_along(V1), by="variable"][, `:=`(P = N/.N, C = cumsum(V1)/sum(V1)), by="variable"]
+# gg = ggplot(pl, aes(x=P, y=C, col=variable)) +
+#   geom_abline(slope = 1, intercept = 0, linetype = "dashed", col = "grey25") + geom_line() +
+#   scale_x_continuous("Fraction of bound protein-coding RNAs", labels = percent) +
+#   scale_y_continuous("Fraction of snoRNA in bound protein-coding genes", labels = percent) +
+#   scale_colour_jco() +
+#   theme_bw() + theme(legend.position = c(0.8, 0.25), legend.background = element_blank()) + guides(colour=guide_legend(title=""))
+# save_plot(gg, filename = file.path(working.folder, "images", "iCLIP_BoundProteinCodingAndSnoRNA_CDF.png"), units = "in", base_height = 6, base_aspect_ratio = 1, dpi = 300)
+# save_plot(gg, filename = file.path(working.folder, "plots", "iCLIP_BoundProteinCodingAndSnoRNA_CDF.pdf"), base_height = 6, base_aspect_ratio = 1, device = cairo_pdf)
+```
+
+
+```{r differential_expression_repeats}
+tab = data.table(as.data.frame(repeats),
+           DKC1 = rowMeans(sapply(bed.iclip[1:2], function(x) countOverlapsWeighted(repeats, x)/sum(x$score)*1e6)),
+           DKC1_Up = rowMeans(sapply(bed.iclip[1:2], function(x) countOverlapsWeighted(flank(repeats, width=width(repeats), start=TRUE, both=FALSE), x)/sum(x$score)*1e6)),
+           DKC1_Down = rowMeans(sapply(bed.iclip[1:2], function(x) countOverlapsWeighted(flank(repeats, width=width(repeats), start=FALSE, both=FALSE), x)/sum(x$score)*1e6)),
+           GAR1 = rowMeans(sapply(bed.iclip[3:4], function(x) countOverlapsWeighted(repeats, x)/sum(x$score)*1e6)),
+           GAR1_Up = rowMeans(sapply(bed.iclip[3:4], function(x) countOverlapsWeighted(flank(repeats, width=width(repeats), start=TRUE, both=FALSE), x)/sum(x$score)*1e6)),
+           GAR1_Down = rowMeans(sapply(bed.iclip[3:4], function(x) countOverlapsWeighted(flank(repeats, width=width(repeats), start=FALSE, both=FALSE), x)/sum(x$score)*1e6)))
+
+
+pl = tab[overlapsAny(GRanges(tab), genes) & !overlapsAny(GRanges(tab), exonsByGene) & DKC1>0,]
+pl = melt.data.table(pl[DKC1/width*1000>1,], id.vars = c("seqnames", "start", "end", "width", "repClass"), measure.vars = c("DKC1", "DKC1_Up", "DKC1_Down"))
+pl[, variable := factor(variable, levels=c("DKC1_Up", "DKC1", "DKC1_Down"))]
+
+gg1 = ggplot(pl, aes(x=variable, y=(value)/width*1000+1)) +
+  geom_boxplot(notch=FALSE, outlier.size = 1) +
+  scale_x_discrete("Repeat element") + scale_y_log10("Normalised binding (CPKM + 1)", labels=comma) +
+  stat_compare_means(ref.group = "DKC1", label = "p.signif") + theme_few()
+
+pl = pl[, .N, by="repClass"]
+pl[N<200, repClass := "Other repeats"]
+pl = pl[, .(N = sum(N)), by="repClass"]
+pl[, repClass := factor(repClass, levels=c("Other repeats", grep("Other", .SD[order(N), repClass], invert = TRUE, value = TRUE)))]
+pl = pl[order(repClass), .(repClass, N, P=N/sum(N), Pos = sum(N)-(cumsum(N)-N+N/2))]
+
+gg1.1 = ggplot(pl, aes(x=as.factor(1), y=N, fill=repClass)) + ggtitle("DKC1") +
+  geom_bar(stat="identity", position="stack", col="black") +
+  geom_text_repel(aes(label=paste0(round(P*100, 1), "%"), y=Pos), x=1.6, ) +
+  scale_fill_viridis(option = "turbo", discrete=TRUE) +
+  coord_polar(theta="y") + theme_void() + guides(fill=guide_legend(title="Repeat class", reverse = TRUE))
+
+
+pl = tab[overlapsAny(GRanges(tab), genes) & !overlapsAny(GRanges(tab), exonsByGene) & GAR1>0,]
+pl = melt.data.table(pl[GAR1/width*1000>1,], id.vars = c("seqnames", "start", "end", "width", "repClass"), measure.vars = c("GAR1", "GAR1_Up", "GAR1_Down"))
+pl[, variable := factor(variable, levels=c("GAR1_Up", "GAR1", "GAR1_Down"))]
+
+gg2 = ggplot(pl, aes(x=variable, y=(value)/width*1000+1)) +
+  geom_boxplot(notch=FALSE, outlier.size = 1) +
+  scale_x_discrete("Repeat element") + scale_y_log10("Normalised binding (CPKM + 1)", labels=comma) +
+  stat_compare_means(ref.group = "GAR1", label = "p.signif") + theme_few()
+
+pl = pl[, .N, by="repClass"]
+pl[N<200, repClass := "Other repeats"]
+pl = pl[, .(N = sum(N)), by="repClass"]
+pl[, repClass := factor(repClass, levels=c("Other repeats", grep("Other", .SD[order(N), repClass], invert = TRUE, value = TRUE)))]
+pl = pl[order(repClass), .(repClass, N, P=N/sum(N), Pos = sum(N)-(cumsum(N)-N+N/2))]
+
+gg2.1 = ggplot(pl, aes(x=as.factor(1), y=N, fill=repClass)) + ggtitle("GAR1") +
+  geom_bar(stat="identity", position="stack", col="black") +
+  geom_text(aes(label=paste0(round(P*100, 1), "%"), y=Pos), x=1.6, ) +
+  scale_fill_viridis(option = "turbo", discrete=TRUE) +
+  coord_polar(theta="y") + theme_void() + guides(fill=guide_legend(title="Repeat class", reverse = TRUE))
+
+gg = ggarrange(gg1, gg2, ncol=2)
+ggsave(gg, filename = file.path(working.folder, "images", "Figure_S4D.png"), units = "in", width = 8, height = 4, dpi = 300)
+ggsave(gg, filename = file.path(working.folder, "plots", "Figure_S4D.pdf"), width = 8, height = 4, device = cairo_pdf)
+
+gg = ggarrange(gg1.1, gg2.1, ncol=2)
+ggsave(gg, filename = file.path(working.folder, "images", "Figure_S4E.png"), units = "in", width = 12, height = 6, dpi = 300)
+ggsave(gg, filename = file.path(working.folder, "plots", "Figure_S4E.pdf"), width = 12, height = 6, device = cairo_pdf)
+```
+
+![](images/Figure_S4D.png)
+
+![](images/Figure_S4E.png)
+
+```{r}
+if( !file.exists("Repeats_iCLIP_RNAseq.rds") ){
+  message("Loading RNAseq reads...")
+  rnaseq_reads = readRDS(file.path(working.folder, "RData", "RNAseq_reads_siRNAs.rds"))
+  exp = data.table(gr, sapply(rnaseq_reads, function(x) countOverlaps(GRanges(gr), x)))
+  saveRDS(exp, file = "Repeats_iCLIP_RNAseq.rds")
+}else{
+  message("Loading repeats expression...")
+  exp = readRDS("Repeats_iCLIP_RNAseq.rds")
+}
+
+# Add repeat counts to gene expression table
+cnt = dds.salmon[["counts"]]
+cnt = rbind(cnt,
+            data.frame(exp[, .(name=paste(repFamily, .I, sep="_"), siCtrl_1, siCtrl_2, siCtrl_3, siDKC1_1, siDKC1_2, siDKC1_3, siGAR1_1, siGAR1_2, siGAR1_3)],
+                       row.names = 1))
+
+dds = DESeqDataSetFromMatrix(cnt, colData = dds.samples, design = ~ Treatment)
+
+keep = rowSums(counts(dds)) >= 10
+dds = dds[keep,]
+
+dds = DESeq(dds)
+
+repDKC1 = results(dds, contrast = c("Treatment", "siDKC1", "siCtrl"))
+repGAR1 = results(dds, contrast = c("Treatment", "siGAR1", "siCtrl"))
+
+tab2 = data.table(as.data.frame(repeats),
+           DKC1 = rowSums(sapply(bed.peaks[1:2], function(x) countOverlaps(repeats, x)))==2,
+           GAR1 = rowSums(sapply(bed.peaks[3:4], function(x) countOverlaps(repeats, x)))==2)
+
+tab3 = data.table(as.data.frame(repeats),
+           DKC1 = rowSums(sapply(bed.clusters[1:2], function(x) countOverlaps(repeats, x)))==2,
+           GAR1 = rowSums(sapply(bed.clusters[3:4], function(x) countOverlaps(repeats, x)))==2)
+
+
+regionsList = list(five = fiveUTRsByTranscript(TxDb, use.names=TRUE),
+                   cds = cdsBy(TxDb, by="tx", use.names=TRUE),
+                   intron = intronsByTranscript(TxDb, use.names=TRUE),
+                   three = threeUTRsByTranscript(TxDb, use.names=TRUE))
+
+shared = intersect(intersect(names(regionsList[[1]]), names(regionsList[[2]])), intersect(names(regionsList[[3]]), names(regionsList[[4]])))
+
+# regionsList = lapply(regionsList, function(x) x[names(x)%in%intersect(shared, expressed_transcripts[order(gene_id, -Length),][!duplicated(gene_id), tx_id])])
+regionsList = lapply(regionsList, function(x) x[names(x)%in%intersect(shared, txs.metadata[order(gene_id, -width),][!duplicated(gene_id), transcript_id])])
+
+pl = lapply(bed.peaks[1:4],
+            function(x)
+              sapply(regionsList,
+                     function(y)
+                       countOverlapsWeighted(y, subsetByOverlaps(x, genes[!names(genes)%in%txs.metadata[transcript_id%in%names(regionsList[[1]]), gene_id]], invert = TRUE))))
+
+pl = rbindlist(lapply(pl, function(x) as.data.table(prop.table(colSums(x)), keep.rownames=TRUE)), idcol="sample")
+pl[, c("Target", "Rep") := tstrsplit(sample, "_")]
+pl = pl[, .(V2=mean(V2)), by=c("Target", "V1")]
+pl[, V1 := factor(V1, levels=c("five", "cds", "three", "intron"))]
+pl[order(V1), pos := 1-(cumsum(V2)-V2/2), by="Target"]
+
+gg = ggplot(pl, aes(x=as.factor(1), y=V2, fill=V1)) +
+  geom_bar(stat="identity", position="stack", col="black", lwd=0.5) +
+  scale_fill_aaas(alpha = 0.75, labels=c("5'-UTR", "CDS", "3'-UTR", "Intron")) +
+  geom_text(aes(x=1.65, label=paste0(round(V2*100, 1), "%"), y=pos), inherit.aes=FALSE) + coord_polar(theta="y") +
+  facet_grid(~Target) +
+  theme_void() +
+  theme(legend.position="bottom") +
+  guides(fill=guide_legend(title="Genic region"))
+ggsave(gg, filename = file.path(working.folder, "images", "Figure4D.png"), dpi = 300, width = 8, height = 4)
+ggsave(gg, filename = file.path(working.folder, "plots", "Figure4D.pdf"), device = cairo_pdf, dpi = 300, width = 8, height = 4)
+```
+
+
+```{r}
+pl = lapply(bed.peaks[1:4],
+            function(x)
+              distanceToNearest(subsetByOverlaps(subsetByOverlaps(x, genes), exonsByGene, invert = TRUE), unlist(exonsByGene)))
+pl = rbindlist(lapply(pl, as.data.table), idcol="sample")
+pl[, c("Target", "Rep") := tstrsplit(sample, "_")]
+gg = ggplot(pl, aes(x=distance+1, fill=Target)) +
+  geom_histogram(aes(y=..density..), col="black", bins=50, position="identity", alpha=0.75) +
+  scale_x_log10(breaks=c(1, 10, 1e2, 1e3, 1e4, 1e5), labels=comma) +
+  scale_fill_jco() +
+  theme_few() + theme(legend.position=c(0.1, 0.8), axis.text = element_text(colour = "black"), panel.border = element_rect(colour = "black")) +
+  guides(fill=guide_legend(title="")) + labs(x = "Peak distance to nearest exon (nt)", y = "Density")
+ggsave(gg, filename = file.path(working.folder, "images", "Figure_S4C.png"), dpi = 300, width = 6, height = 4)
+ggsave(gg, filename = file.path(working.folder, "plots", "Figure_S4C.pdf"), device = cairo_pdf, dpi = 300, width = 6, height = 4)
+```
+
+![](images/Figure_S4C.png)
+
+```{r read_chip_data}
+# USER_ACTION: Add the paths to the BAM files to the following statement:
+chipTable = data.table(Sample = c("U2OS_DKC1_None_1", "U2OS_DKC1_None_2", "U2OS_RNAPII_None_1", "U2OS_RNAPII_None_2", "U2OS_Input_None_1", "U2OS_Input_None_2"),
+                       BamFile = list.files(file.path(chipseq.folder), pattern="bam$"))
+
+chipTable[, c("Cell", "Target", "Condition", "Replicate") := tstrsplit(Sample, "_")]
+
+chipTable = chipTable[order(Cell, Target, Condition, Replicate),]
+
+bam_params = ScanBamParam(flag = scanBamFlag(isPaired = FALSE, isUnmappedQuery = FALSE,
+                                             isSecondaryAlignment = NA, isDuplicate = NA))
+
+if( !file.exists(file.path(working.folder, "RData", "ChIPseq_reads_manuscipt.rds")) ){
+  chip_data = lapply(chipTable[, setNames(BamFile, Sample)],
+                function(x){
+                  tmp = readGAlignments(x, index = x, param = bam_params)
+                  tmp = keepSeqlevels(tmp, chromosomes, pruning.mode = "coarse")
+                  return(GRanges(tmp))
+                })
+  saveRDS(chip_data, file = file.path(working.folder,"RData", "ChIPseq_reads_manuscipt.rds"))
+}else{
+  message("Reading ChIPseq data...")
+  chip_data = readRDS(file.path(working.folder, "RData", "ChIPseq_reads_manuscipt.rds"))
+}
+```
+
+
+```{r}
+chip_data = readRDS(file.path(working.folder, "RData", "ChIPseq_reads_manuscipt.rds"))
+
+genes.selected = genes.pc.granges[expressed_genes[gene_id%in%names(genes.pc.granges) & TPM>=1, gene_id]]
+
+tab = data.table(as.data.frame(genes.selected),
+                 as.data.table(lapply(chip_data[grepl("None", names(chip_data))],
+                                function(x)
+                                  (countOverlaps(resize(genes.selected, width(genes.selected)+2e3, fix="center"), x, ignore.strand=TRUE)+1)/(width(genes.selected)+2e3)*1e3/length(x)*1e6)))
+
+tab[, withRNA := overlapsAny(GRanges(tab), GRanges(gene.metadata[gene_type%in%c("snoRNA", "scaRNA")]), ignore.strand=TRUE)]
+
+tab[, `:=`(DKC1_1_Norm = ChIPseq_U2OS_DKC1_None_1/ChIPseq_U2OS_Input_None_1, DKC1_2_Norm = ChIPseq_U2OS_DKC1_None_2/ChIPseq_U2OS_Input_None_2)]
+
+tab[, TPM := expressed_genes[match(tab[, gene_id], gene_id), TPM]]
+
+bind = tab[order(-(DKC1_1_Norm+DKC1_2_Norm)/2), .(index = .I, hasRNA = cumsum(withRNA)/sum(withRNA))]
+expr = tab[order(-TPM), .(index = .I, hasRNA = cumsum(withRNA)/sum(withRNA))]
+
+gg = ggplot(bind, aes(x=index, y=hasRNA)) +
+  ggtitle("Expressed protein-coding genes") +
+  geom_abline(slope=1/nrow(bind), intercept=0, linetype="dashed", colour="grey25") +
+  geom_line(data = expr, col=pal_lancet()(2)[2], lwd=1) + geom_line(col=pal_lancet()(2)[1], lwd=1) +
+  scale_x_continuous(name="Rank by DKC1 normalised binding", sec.axis=dup_axis(name="Rank by expression (TPM)")) +
+  scale_y_continuous("Percentage of genes containing at least a snoRNA/scaRNA", labels=percent) +
+  theme_few() + theme(axis.title.x.bottom = element_text(colour=pal_lancet()(2)[1]), axis.title.x.top = element_text(colour=pal_lancet()(2)[2])) +
+  coord_fixed(ratio=nrow(bind))
+ggsave(gg, filename = file.path(working.folder, "images", "Figure_S2E.png"), units = "in", width = 6, height = 6, dpi = 300)
+ggsave(gg, filename = file.path(working.folder, "plots", "Figure_S2E.pdf"), width = 6, height = 6, device = cairo_pdf)
+```
+
+![](images/Figure_S2E.png)
+
+```{r}
+# iCLIP vs ChIP binding
+tab = lapply(bed.iclip[1:4], function(x) data.table(txs.metadata[match(names(longest_transcripts), transcript_id),],
+                                                    count = countOverlapsWeighted(longest_transcripts, x), tx_width = sum(width(longest_transcripts)), total = sum(x$score)))
+for( i in seq_along(tab) ){
+  tab[[i]][, norm := count/total*1e6/tx_width*1e3]
+  tab[[i]] = tab[[i]][count>0,]
+}
+
+pl = rbindlist(tab, idcol="sample")
+pl[, target := tstrsplit(sample, "_")[[1]]]
+pl = pl[, .(norm = mean(norm)), by=c("target", "gene_id", "gene_type", "gene_name")]
+pl[, norm := log10(norm)]
+pl = dcast.data.table(pl, gene_id+gene_type+gene_name~target, value.var = "norm", fill=NA)
+setkey(pl, gene_id)
+pl[gene.metadata, gene_group := factor(gene_group, levels=c("protein_coding", "long_ncRNA", "ncRNA", "other"))]
+
+chip_data_dkc1 = chip_data[grepl("DKC1_None", names(chip_data))]
+
+genes.selected = GRanges(gene.metadata[gene_group=="protein_coding",])
+
+tab = data.table(as.data.frame(genes.selected),
+                 as.data.table(lapply(chip_data_dkc1,
+                                function(x)
+                                  countOverlaps(resize(resize(genes.selected, width(genes.selected)+1e3, fix="end"), width(genes.selected)+1e3+2e3, fix="start"), x, ignore.strand=TRUE)/(width(genes.selected)+3e3)*1e3/length(x)*1e6)))
+tab = tab[, .(gene_id, ChIPseq = rowMeans(tab[, (ncol(tab)-1):(ncol(tab)), with=FALSE]))]
+setkey(tab, gene_id)
+
+pl = merge.data.table(pl[gene_type=="protein_coding",], tab, by.x = "gene_id", by.y = "gene_id", all = TRUE)
+pl = pl[order(-ChIPseq),][ChIPseq>0,]
+pl[is.na(DKC1), DKC1 := -Inf][is.na(GAR1), GAR1 := -Inf]
+
+pl2 = pl[, .(ChIPseq, I=.I, DKC1, GAR1,
+             CDF_DKC1 = cumsum(DKC1>=.SD[order(-DKC1) & DKC1>-Inf, quantile(DKC1, 0.95)])/sum(DKC1>=.SD[order(-DKC1) & DKC1>-Inf, quantile(DKC1, 0.95)]),
+             CDF_GAR1 = cumsum(GAR1>=.SD[order(-GAR1) & GAR1>-Inf, quantile(GAR1, 0.95)])/sum(GAR1>=.SD[order(-GAR1) & GAR1>-Inf, quantile(GAR1, 0.95)]))]
+gg = ggplot(melt.data.table(pl2, id.vars="I", measure.vars=c("CDF_DKC1", "CDF_GAR1")), aes(x=I, y=value, col=gsub("CDF_", "", variable))) +
+  geom_abline(intercept = 0, slope = 1/nrow(pl2), linetype="dashed") +
+  geom_line(lwd=1) + scale_colour_lancet(name="") +
+  geom_rug(data = pl2[!duplicated(CDF_DKC1) & DKC1>-Inf,], aes(x=I), sides="b", col=pal_lancet()(2)[1], size=0.1, inherit.aes=FALSE) +
+  geom_rug(data = pl2[!duplicated(CDF_GAR1) & GAR1>-Inf,], aes(x=I), sides="t", col=pal_lancet()(2)[2], size=0.1, inherit.aes=FALSE) +
+  scale_x_continuous("Genes ranked by ChIP-seq binding (CPKM)") +
+  scale_y_continuous("Protein bound genes (CDF)") +
+  theme_few() + coord_fixed(ratio=20000) + theme(legend.position=c(0.8, 0.2))
+ggsave(gg, filename = file.path(working.folder, "images", "Figure_S4F.png"), dpi = 300, width = 6, height = 6)
+ggsave(gg, filename = file.path(working.folder, "plots", "Figure_S4F.pdf"), device = cairo_pdf, dpi = 300, width = 6, height = 6)
+```
+
+![](images/Figure_S4F.png)
+
+```{r plotDeepTools}
+export.bed(genes.pc.granges[expressed_genes[gene_id%in%names(genes.pc.granges) & TPM>=1, gene_id]], "deepTools/protein_coding_expressed.bed")
+
+tab = expressed_genes[gene_id%in%names(genes.pc.granges),]
+tab[, Quartile := cut(TPM, quantile(TPM, seq(0, 1, 0.25)), labels = c("I", "II", "III", "IV"), include.lowest=TRUE)]
+for( i in unique(tab[, Quartile]) )
+  export.bed(genes.pc.granges[tab[Quartile==i, gene_id],], file.path("deepTools", paste0("protein_coding_expQ_", i, ".bed")))
+
+export.bed(genes.pc.granges[expressed_genes[gene_id%in%names(genes.pc.granges) & TPM>=20, gene_id]], "deepTools/protein_coding_high.bed")
+export.bed(genes.pc.granges[expressed_genes[gene_id%in%names(genes.pc.granges) & TPM<20, gene_id]], "deepTools/protein_coding_low.bed")
+sel = gene.metadata[gene_id%in%names(genes.nc.granges) & gene_group=="long_ncRNA", gene_id]
+export.bed(genes.nc.granges[gene_expression[gene_id%in%names(genes.nc.granges) & gene_id%in%sel & TPM>=0.1, gene_id]], "deepTools/long_ncRNA_high.bed")
+export.bed(genes.nc.granges[gene_expression[gene_id%in%names(genes.nc.granges) & gene_id%in%sel & TPM>0 & TPM<0.1, gene_id]], "deepTools/long_ncRNAg_low.bed")
+
+# DKC1 scaled profiles
+pl = melt.data.table(fread("deepTools/ChIP_Fig2A.tsv", skip=2), id.vars=c("V1", "V2"))
+setnames(pl, "V1", "Target")
+# pl[, c("Target", "Replicate") := tstrsplit(V1, " ")][, Condition := "None"]#[grepl("Flavo", Target), c("Target", "Condition") := tstrsplit(Target, "-")]
+pl[, Pos := .SD[, .I], by=c("Target", "V2")]
+
+gg = ggplot(pl, aes(x=Pos, y=value, col=Target)) +
+  geom_vline(xintercept=c(201, 402), linetype="dashed", colour="grey75") +
+  geom_smooth(se=FALSE, span=0.05) +
+  scale_x_continuous("Position relative to genic feature", breaks=c(1, 201, 401, 600), labels=c("-2kb", "TSS", "TES", "+2kb")) +
+  scale_y_continuous("Normalised coverage\n(fold-change over input)") +
+  scale_colour_lancet(alpha=0.75, guide="none") +
+  theme_few() + theme(axis.text= element_text(colour = "black", size = 12, family="Helvetica"),
+                         strip.background = element_blank(), strip.text = element_text(size = 12))
+ggsave(gg, filename = file.path(working.folder, "images", "Figure_2A.png"), units = "in", width = 8, height = 4, dpi = 300)
+ggsave(gg, filename = file.path(working.folder, "plots", "Figure_2A.pdf"), width = 8, height = 4, device = cairo_pdf)
+
+# pl = melt.data.table(fread("deepTools/ChIP_Fig2E-F.tsv", skip=2), id.vars=c("V1", "V2"))
+# pl[, c("Target", "Cell") := tstrsplit(V1, " ")]
+# pl[, Quartile := tstrsplit(gsub(".bed", "", V2), "_")[[4]]]
+# pl[, Pos := .SD[, .I], by=c("V1", "V2")]
+# 
+# gg = ggplot(pl[Cell=="U2OS",], aes(x=Pos, y=value, col=Quartile)) +
+#   geom_vline(xintercept=c(201, 402), linetype="dashed", colour="grey75") +
+#   geom_smooth(se=FALSE, span=0.1) +
+#   scale_x_continuous("Position relative to genic feature", breaks=c(1, 201, 401, 600), labels=c("-2kb", "TSS", "TES", "+2kb")) +
+#   scale_y_continuous("Normalised coverage\n(fold-change over input)") +
+#   scale_colour_viridis(option="inferno", discrete=TRUE, begin=0.2, end=0.8) +
+#   facet_wrap(~Cell) +
+#   theme_few() + theme(axis.text= element_text(colour = "black", size = 12, family="Helvetica"),
+#                          strip.background = element_blank(), strip.text = element_text(size = 12),
+#                          legend.position = c(0.1, 0.75)) +
+#                          guides(colour = guide_legend(title="Expression\nquartile", reverse=TRUE))
+# ggsave(gg, filename = file.path(working.folder, "images", "Figure2E.png"), units = "in", width = 8, height = 4, dpi = 300)
+# ggsave(gg, filename = file.path(working.folder, "plots", "Figure2E.pdf"), width = 8, height = 4, device = cairo_pdf)
+
+
+pl = melt.data.table(fread("deepTools/ChIP_Fig2D_TSS.tsv", skip=2), id.vars=c("V1", "V2"))
+pl[, c("Target", "Condition") := tstrsplit(V1, " ")]
+pl[, Pos := .SD[, .I], by=c("V1", "V2")]
+
+pl1 = pl[Condition!="Flavo",]
+setkeyv(pl1, c("Target", "Pos"))
+pl2 = pl[Condition=="Flavo",]
+setkeyv(pl2, c("Target", "Pos"))
+pl2[pl1, FC := (2^value)/(2^i.value)]
+
+gg = ggplot(pl2, aes(x=Pos, y=FC, col=Target)) +
+  geom_vline(xintercept=251, linetype="dashed", colour="grey75") +
+  geom_smooth(se=FALSE, span=0.1) +
+  scale_x_continuous("Position relative to transcription start site (TSS)", breaks=c(1, 251, 500), labels=c("-5kb", "TSS", "+5kb")) +
+  scale_y_continuous("Normalised coverage fold-change\n(Flavopiridol over control)") +
+  scale_colour_lancet(alpha=0.75, guide="none") +
+  facet_wrap(~Target, scales="free_y") +
+  theme_few() + theme(axis.text= element_text(colour = "black", size = 12, family="Helvetica"),
+                         strip.background = element_blank(), strip.text = element_text(size = 12))
+ggsave(gg, filename = file.path(working.folder, "images", "Figure_2C.png"), units = "in", width = 8, height = 4, dpi = 300)
+ggsave(gg, filename = file.path(working.folder, "plots", "Figure_2C.pdf"), width = 8, height = 4, device = cairo_pdf)
+
+# # # All TES profiles
+# pl = melt.data.table(fread("deepTools/ChIP_Fig2D_TES.tsv", skip=2), id.vars=c("V1", "V2"))
+# pl[, c("Target", "Condition") := tstrsplit(V1, " ")]
+# pl[, Pos := .SD[, .I], by=c("V1", "V2")]
+# 
+# pl1 = pl[Condition!="Flavo",]
+# setkeyv(pl1, c("Target", "Pos"))
+# pl2 = pl[Condition=="Flavo",]
+# setkeyv(pl2, c("Target", "Pos"))
+# pl2[pl1, FC := (2^value)/(2^i.value)]
+# 
+# gg = ggplot(pl2, aes(x=Pos, y=FC, col=Target)) +
+#   geom_vline(xintercept=251, linetype="dashed", colour="grey75") +
+#   geom_smooth(se=FALSE, span=0.1) +
+#   scale_x_continuous("Position relative to transcription end site (TES)", breaks=c(1, 251, 500), labels=c("-5kb", "TES", "+5kb")) +
+#   scale_y_continuous("Normalised coverage fold-change\n(Flavopiridol over control)") +
+#   scale_colour_lancet(alpha=0.75, guide="none") +
+#   facet_wrap(~Target, scales="free_y") +
+#   theme_few() + theme(axis.text= element_text(colour = "black", size = 12, family="Helvetica"),
+#                          strip.background = element_blank(), strip.text = element_text(size = 12))
+# ggsave(gg, filename = file.path(working.folder, "images", "Figure2D.2.png"), units = "in", width = 8, height = 4, dpi = 300)
+# ggsave(gg, filename = file.path(working.folder, "plots", "Figure2D.2.pdf"), width = 8, height = 4, device = cairo_pdf)
+# 
+
+pl = melt.data.table(fread("deepTools/ChIP_Fig2F.tsv", skip=2), id.vars=c("V1", "V2"))
+pl[, c("Target", "Cell") := tstrsplit(V1, " ")]
+pl[, Quartile := tstrsplit(gsub(".bed", "", V2), "_")[[4]]]
+pl[, Pos := .SD[, .I], by=c("V1", "V2")]
+pl[, Cell := factor(Cell, levels=c("U2OS", "HCT"))]
+
+gg = ggplot(pl[Cell=="U2OS"], aes(x=Pos, y=value, col=Quartile)) +
+  geom_vline(xintercept=251, linetype="dashed", colour="grey75") +
+  geom_smooth(se=FALSE, span=0.1) +
+  scale_x_continuous("Position relative to transcription end site (TES)", breaks=c(1, 251, 500), labels=c("-5kb", "TES", "+5kb")) +
+  scale_y_continuous("Normalised coverage\n(fold-change over input)", limits=c(0, 0.05)) +
+  scale_colour_viridis(option="inferno", discrete=TRUE, begin=0.2, end=0.8) +
+  facet_wrap(~Cell) +
+  theme_few() + theme(axis.text= element_text(colour = "black", size = 12, family="Helvetica"),
+                         strip.background = element_blank(), strip.text = element_text(size = 12),
+                         legend.position = c(0.1, 0.75), legend.background=element_blank()) +
+                         guides(colour = guide_legend(title="Expression\nquartile", reverse=TRUE))
+ggsave(gg, filename = file.path(working.folder, "images", "Figure_2G1.png"), units = "in", width = 6, height = 4, dpi = 300)
+ggsave(gg, filename = file.path(working.folder, "plots", "Figure_2G1.pdf"), width = 6, height = 4, device = cairo_pdf)
+
+gg = ggplot(pl[Cell=="HCT"], aes(x=Pos, y=value, col=Quartile)) +
+  geom_vline(xintercept=251, linetype="dashed", colour="grey75") +
+  geom_smooth(se=FALSE, span=0.1) +
+  scale_x_continuous("Position relative to transcription end site (TES)", breaks=c(1, 251, 500), labels=c("-5kb", "TES", "+5kb")) +
+  scale_y_continuous("Normalised coverage\n(fold-change over input)", limits=c(0, 0.05)) +
+  scale_colour_viridis(option="inferno", discrete=TRUE, begin=0.2, end=0.8) +
+  facet_wrap(~Cell) +
+  theme_few() + theme(axis.text= element_text(colour = "black", size = 12, family="Helvetica"),
+                         strip.background = element_blank(), strip.text = element_text(size = 12),
+                         legend.position = c(0.1, 0.75), legend.background=element_blank()) +
+                         guides(colour = guide_legend(title="Expression\nquartile", reverse=TRUE))
+ggsave(gg, filename = file.path(working.folder, "images", "Figure_2G2.png"), units = "in", width = 6, height = 4, dpi = 300)
+ggsave(gg, filename = file.path(working.folder, "plots", "Figure_2G2.pdf"), width = 6, height = 4, device = cairo_pdf)
+```
+
+![](images/Figure_2A.png)
+
+![](images/Figure_2C.png)
+
+![](images/Figure_2G1.png)
+
+![](images/Figure_2G2.png)
