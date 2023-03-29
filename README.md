@@ -82,9 +82,11 @@ Download the [Gencode v27](https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_h
 
 Generate the RepeatMasker annotation (`TSV` format) by using the [TableBrowser](https://genome.ucsc.edu/cgi-bin/hgTables), rename it `hg38_repeatMasker.tsv.gz`, and place it into `data/Annotation`.
 
-Some of the files that are employed by the script were too large to be uploaded on this repository and, therefore, they have to be either retrieved from the GEO repository or generated (_e.g._ mapped `BAM` files, normalised `BigWig` coverage files, _etc._), before they can be read into R.
+Some of the files that are employed by the script were too large to be uploaded on this repository and, therefore, they must be either retrieved from the GEO repository ([GSE211202](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE211202)) or generated (_e.g._ mapped `BAM` files, normalised `BigWig` coverage files, _etc._) before they can be read into R or deepTools.
 
-#### [IMPORTANT] Define local paths
+> NOTE: The code can be executed even without BAM files, but some steps might not return the expected output. 
+
+### [CRUCIAL] Define local paths
 
 In the main [R markdown file](datA_analysis.Rmd), which contains the procedure on the majority of the analysis and visualisations, there are some headers marked as __USER_ACTION__; these define sections/statements that have to be changed/modified by the user in order to locate and import the files required for these steps. Briefly, these include the RepeatMasker annotation, the Salmon quantification paths, and the BAM files for the different datasets. For convenience, the [rosetta table](rosettaTable.tsv) file, which contains labels and paths to the required BAM files, is read into R; so, make sure to modify it according to your setup.
 

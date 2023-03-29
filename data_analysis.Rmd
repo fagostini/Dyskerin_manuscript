@@ -261,6 +261,7 @@ export.bed(genes.snc.granges, file.path(working.folder, "beds", "gencode.v27.sma
 
 ### USER_ACTION: Add the paths to the Salmon quantification folders:
 
+
 ```{r load_Salmon_results}
 sampleTable = data.table(Sample = list.files(file.path(rnaseq.folder, "salmon")))
 sampleTable[, c("Treatment", "Replicate") := tstrsplit(Sample, "_")[c(3, 5)]]
@@ -476,34 +477,7 @@ ggsave(gg, filename = file.path(working.folder, "plots", "Figure_S3D.pdf"), devi
 ![](images/Figure_S3D.png)
 
 ```{r load_iCLIP_results}
-# sampleTable = data.table(Label=c(c("GTAGA", "CTGTA", "GTAAC", "ATCCA",
-#                                      "TATGA", "GGAGC", "AGTTA", "TCACA",
-#                                      "CATAC", "TCGCC", "CAGAA", "AGTCC"),
-#                                    c("dkc1-u2os-4su-1", "dkc1-u2os-x-1", "gar1-u2os-4su-0-4",
-#                                      "gar1-u2os-4su-1", "gar1-u2os-x-0-4", "gar1-u2os-x-1",
-#                                      "igg-u2os-4su-1-u-ml-rnasei-20180504-ju_", "igg-u2os-4su-1-u-ml-rnasei-20180504-ju-2",
-#                                      "igg-u2os-x-1-u-ml-rnasei-20180504-ju_", "igg-u2os-x-1-u-ml-rnasei-20180504-ju-2")),
-#                          Sample=c(c("IgG-DKC1_PARPi", "IgG-GAR1_UV", "IgG-DKC1_UV", "DKC1_PARPi",
-#                                     "GAR1_UV", "IgG-DKC1_noUV", "DKC1_UV", "IgG-GAR1_PARPi",
-#                                     "GAR1_noUV", "IgG-GAR1_noUV", "GAR1_PARPi", "DKC1_noUV"),
-#                                   c("DKC1_4SU-1", "DKC1_X-1", "GAR1_4SU-0.4", "GAR1_4SU-1",
-#                                     "GAR1_X-0.4", "GAR1_X-1",
-#                                     "IgG-DKC1_4SU-1", "IgG-GAR1_4SU-1",
-#                                     "IgG-DKC1_X-1", "IgG-GAR1_X-1")),
-#                          Batch=c(rep(1, 12), rep(2, 10)))
-# 
-# sampleTable[, c("Target", "Treatment") := tstrsplit(Sample, "_")]
-# 
-# sampleTable = sampleTable[order(Target, Treatment)]
-# 
-# # Subselect only sample that are used in this analysis
-# sampleTable = sampleTable[!Treatment%in%c("4SU-1", "PARPi", "UV", "4SU-0.4", "X-0.4"),]
-# 
-# files.iclip = list.files(file.path(clipseq.folder, "iCLIP"), pattern="*_single.bed.gz")
-# 
-# sampleTable[, File := grep(Label, files.iclip, value=TRUE), by="Sample"]
-
-sampleTable = data.table(File = list.files(file.path(clipseq.folder), pattern="single.bed.gz"))
+sampleTable = rosettaTable[Technique=="iCLIP", .(File=Reads, Sample)]
 sampleTable[, c("Target", "Replicate") := tstrsplit(File, "_")[1:2]]
 sampleTable[, Sample := paste(Target, Replicate, sep="_")]
 
@@ -883,9 +857,9 @@ ggsave(gg, filename = file.path(working.folder, "plots", "Figure_3F.pdf"), devic
 ![](images/Figure_3F.png)
 
 ```{r load_iCount_results}
-# Peaks analysis
-sampleTable[, Peaks := sapply(Sample, function(x) grep(paste0("^", x), list.files(clipseq.folder, pattern="scores.tsv.gz"), value=TRUE))]
+sampleTable = rosettaTable[Technique=="iCLIP", .(File=Reads, Sample, Peaks, Clusters)]
 
+# Peaks analysis
 if( !file.exists(file.path(clipseq.folder, "RData", "iCLIP_all_peaks_GRanges.rds")) ){
   bed.peaks = lapply(sampleTable[, setNames(Peaks, Sample)],
                      function(x){
@@ -903,8 +877,6 @@ if( !file.exists(file.path(clipseq.folder, "RData", "iCLIP_all_peaks_GRanges.rds
 bed.peaks = bed.peaks[order(names(bed.peaks))]
 
 # Cluster analysis
-sampleTable[, Clusters := sapply(Sample, function(x) grep(paste0("^", x), list.files(clipseq.folder, pattern="clusters.bed.gz"), value=TRUE))]
-
 if( !file.exists(file.path(clipseq.folder, "RData", "iCLIP_all_clusters_GRanges.rds")) ){
   bed.clusters = lapply(sampleTable[, setNames(Clusters, Sample)],
                         function(x){

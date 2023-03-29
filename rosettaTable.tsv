@@ -1,24 +1,24 @@
-Sample	Technique	BamFile	Processed
-U2OS_DKC1_None_1	ChIPseq	./data/ChIPseq_data/ChIPseq_U2OS_DKC1_None_1.dedup.sorted.bam
-U2OS_DKC1_None_2	ChIPseq	./data/ChIPseq_data/ChIPseq_U2OS_DKC1_None_2.dedup.sorted.bam
-U2OS_RNAPII_None_1	ChIPseq	./data/ChIPseq_data/ChIPseq_U2OS_RNAPII_None_1.dedup.sorted.bam
-U2OS_RNAPII_None_2	ChIPseq	./data/ChIPseq_data/ChIPseq_U2OS_RNAPII_None_2.dedup.sorted.bam
-U2OS_Input_None_1	ChIPseq	./data/ChIPseq_data/ChIPseq_U2OS_Input_None_1.dedup.sorted.bam
-U2OS_Input_None_2	ChIPseq	./data/ChIPseq_data/ChIPseq_U2OS_Input_None_2.dedup.sorted.bam
-U2OS_iCLIP_dyskerin_rep1	iCLIP	./data/CLIPseq/AGTCC
-U2OS_iCLIP_dyskerin_rep2	iCLIP	./data/CLIPseq/dkc1-u2os-x-1
-U2OS_iCLIP_GAR1_rep1	iCLIP	./data/CLIPseq/CATAC
-U2OS_iCLIP_GAR1_rep2	iCLIP	./data/CLIPseq/gar1-u2os-x-1
-U2OS_iCLIP_IgG-dyskerin_rep1	iCLIP	./data/CLIPseq/GGAGC
-U2OS_iCLIP_IgG-dyskerin_rep2	iCLIP	./data/CLIPseq/igg-u2os-x-1-u-ml-rnasei-20180504-ju_
-U2OS_iCLIP_IgG-GAR1_rep1	iCLIP	./data/CLIPseq/TCGCC
-U2OS_iCLIP_IgG-GAR1_rep2	iCLIP	./data/CLIPseq/igg-u2os-x-1-u-ml-rnasei-20180504-ju-2
-siCtrl_1	RNAseq	./data/RNAseq_data/results/picarded/RNAseq_Nuclear_siCtrl_U2OS_1_PE.Aligned.sortedByCoord.bam
-siCtrl_2	RNAseq	./data/RNAseq_data/results/picarded/RNAseq_Nuclear_siCtrl_U2OS_2_PE.Aligned.sortedByCoord.bam
-siCtrl_3	RNAseq	./data/RNAseq_data/results/picarded/RNAseq_Nuclear_siCtrl_U2OS_3_PE.Aligned.sortedByCoord.bam
-siDKC1_1	RNAseq	./data/RNAseq_data/results/picarded/RNAseq_Nuclear_siDKC1_U2OS_1_PE.Aligned.sortedByCoord.bam
-siDKC1_2	RNAseq	./data/RNAseq_data/results/picarded/RNAseq_Nuclear_siDKC1_U2OS_2_PE.Aligned.sortedByCoord.bam
-siDKC1_3	RNAseq	./data/RNAseq_data/results/picarded/RNAseq_Nuclear_siDKC1_U2OS_3_PE.Aligned.sortedByCoord.bam
-siGAR1_1	RNAseq	./data/RNAseq_data/results/picarded/RNAseq_Nuclear_siGAR1_U2OS_1_PE.Aligned.sortedByCoord.bam
-siGAR1_2	RNAseq	./data/RNAseq_data/results/picarded/RNAseq_Nuclear_siGAR1_U2OS_2_PE.Aligned.sortedByCoord.bam
-siGAR1_3	RNAseq	./data/RNAseq_data/results/picarded/RNAseq_Nuclear_siGAR1_U2OS_3_PE.Aligned.sortedByCoord.bam
+Sample	Technique	Reads	Peaks	Clusters
+U2OS_DKC1_None_1	ChIPseq	./data/ChIPseq_data/ChIPseq_U2OS_DKC1_None_1.dedup.sorted.bam		
+U2OS_DKC1_None_2	ChIPseq	./data/ChIPseq_data/ChIPseq_U2OS_DKC1_None_2.dedup.sorted.bam		
+U2OS_RNAPII_None_1	ChIPseq	./data/ChIPseq_data/ChIPseq_U2OS_RNAPII_None_1.dedup.sorted.bam		
+U2OS_RNAPII_None_2	ChIPseq	./data/ChIPseq_data/ChIPseq_U2OS_RNAPII_None_2.dedup.sorted.bam		
+U2OS_Input_None_1	ChIPseq	./data/ChIPseq_data/ChIPseq_U2OS_Input_None_1.dedup.sorted.bam		
+U2OS_Input_None_2	ChIPseq	./data/ChIPseq_data/ChIPseq_U2OS_Input_None_2.dedup.sorted.bam		
+DKC1_rep1	iCLIP	./data/CLIPseq/U2OS_iCLIP_dyskerin_rep1_single.bed.gz	./data/CLIPseq/U2OS_iCLIP_dyskerin_rep1_scores.tsv.gz	./data/CLIPseq/U2OS_iCLIP_dyskerin_rep1_clusters.bed.gz
+DKC1_rep2	iCLIP	./data/CLIPseq/U2OS_iCLIP_dyskerin_rep2_single.bed.gz	./data/CLIPseq/U2OS_iCLIP_dyskerin_rep2_scores.tsv.gz	./data/CLIPseq/U2OS_iCLIP_dyskerin_rep2_clusters.bed.gz
+GAR1_rep1	iCLIP	./data/CLIPseq/U2OS_iCLIP_GAR1_rep1_single.bed.gz	./data/CLIPseq/U2OS_iCLIP_GAR1_rep1_scores.tsv.gz	./data/CLIPseq/U2OS_iCLIP_GAR1_rep1_clusters.bed.gz
+GAR1_rep2	iCLIP	./data/CLIPseq/U2OS_iCLIP_GAR1_rep2_single.bed.gz	./data/CLIPseq/U2OS_iCLIP_GAR1_rep2_scores.tsv.gz	./data/CLIPseq/U2OS_iCLIP_GAR1_rep2_clusters.bed.gz
+IgG-DKC1_rep1	iCLIP	./data/CLIPseq/U2OS_iCLIP_IgG-dyskerin_rep1_single.bed.gz	./data/CLIPseq/U2OS_iCLIP_IgG-dyskerin_rep1_scores.tsv.gz	./data/CLIPseq/U2OS_iCLIP_IgG-dyskerin_rep1_clusters.bed.gz
+IgG-DKC1_rep2	iCLIP	./data/CLIPseq/U2OS_iCLIP_IgG-dyskerin_rep2_single.bed.gz	./data/CLIPseq/U2OS_iCLIP_IgG-dyskerin_rep2_scores.tsv.gz	./data/CLIPseq/U2OS_iCLIP_IgG-dyskerin_rep2_clusters.bed.gz
+IgG-GAR1_rep1	iCLIP	./data/CLIPseq/U2OS_iCLIP_IgG-GAR1_rep1_single.bed.gz	./data/CLIPseq/U2OS_iCLIP_IgG-GAR1_rep1_scores.tsv.gz	./data/CLIPseq/U2OS_iCLIP_IgG-GAR1_rep1_clusters.bed.gz
+IgG-GAR1_rep2	iCLIP	./data/CLIPseq/U2OS_iCLIP_IgG-GAR1_rep2_single.bed.gz	./data/CLIPseq/U2OS_iCLIP_IgG-GAR1_rep2_scores.tsv.gz	./data/CLIPseq/U2OS_iCLIP_IgG-GAR1_rep2_clusters.bed.gz
+siCtrl_1	RNAseq	./data/RNAseq_data/results/picarded/RNAseq_Nuclear_siCtrl_U2OS_1_PE.Aligned.sortedByCoord.bam		
+siCtrl_2	RNAseq	./data/RNAseq_data/results/picarded/RNAseq_Nuclear_siCtrl_U2OS_2_PE.Aligned.sortedByCoord.bam		
+siCtrl_3	RNAseq	./data/RNAseq_data/results/picarded/RNAseq_Nuclear_siCtrl_U2OS_3_PE.Aligned.sortedByCoord.bam		
+siDKC1_1	RNAseq	./data/RNAseq_data/results/picarded/RNAseq_Nuclear_siDKC1_U2OS_1_PE.Aligned.sortedByCoord.bam		
+siDKC1_2	RNAseq	./data/RNAseq_data/results/picarded/RNAseq_Nuclear_siDKC1_U2OS_2_PE.Aligned.sortedByCoord.bam		
+siDKC1_3	RNAseq	./data/RNAseq_data/results/picarded/RNAseq_Nuclear_siDKC1_U2OS_3_PE.Aligned.sortedByCoord.bam		
+siGAR1_1	RNAseq	./data/RNAseq_data/results/picarded/RNAseq_Nuclear_siGAR1_U2OS_1_PE.Aligned.sortedByCoord.bam		
+siGAR1_2	RNAseq	./data/RNAseq_data/results/picarded/RNAseq_Nuclear_siGAR1_U2OS_2_PE.Aligned.sortedByCoord.bam		
+siGAR1_3	RNAseq	./data/RNAseq_data/results/picarded/RNAseq_Nuclear_siGAR1_U2OS_3_PE.Aligned.sortedByCoord.bam		
