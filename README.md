@@ -1,3 +1,5 @@
+[![DOI](https://zenodo.org/badge/528969587.svg)](https://zenodo.org/badge/latestdoi/528969587)
+
 # Dyskerin manuscript
 
 Code Repository for the Data Analyses of Co-Transcriptional Pseudouridylation 
